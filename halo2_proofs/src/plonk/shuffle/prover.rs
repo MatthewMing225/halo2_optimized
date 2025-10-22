@@ -12,9 +12,9 @@ use crate::{
     },
     transcript::{EncodedChallenge, TranscriptWrite},
 };
-use icicle_runtime::stream::IcicleStream;
 use ff::WithSmallOrderMulGroup;
 use group::Curve;
+use icicle_runtime::stream::IcicleStream;
 use rand_core::RngCore;
 use std::{
     iter,
@@ -190,9 +190,11 @@ impl<F: WithSmallOrderMulGroup<3>> Argument<F> {
         }
 
         let product_blind = Blind(C::Scalar::random(rng));
-        let product_commitment = params.commit_lagrange_with_stream(&z, product_blind, &stream).to_affine();
+        let product_commitment = params
+            .commit_lagrange_with_stream(&z, product_blind, &stream)
+            .to_affine();
         let z = pk.vk.domain.lagrange_to_coeff_stream(z, &stream);
-        
+
         stream.synchronize().unwrap();
         stream.destroy().unwrap();
 

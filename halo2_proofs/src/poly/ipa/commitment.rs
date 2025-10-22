@@ -14,9 +14,9 @@ use std::marker::PhantomData;
 mod prover;
 mod verifier;
 
+use icicle_runtime::stream::IcicleStream;
 pub use prover::create_proof;
 pub use verifier::verify_proof;
-use icicle_runtime::stream::IcicleStream;
 
 use std::io;
 

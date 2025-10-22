@@ -46,8 +46,8 @@ pub use keygen::*;
 pub use prover::*;
 pub use verifier::*;
 
-pub use evaluation::{CalculationInfo, ValueSource, Calculation};
 use evaluation::Evaluator;
+pub use evaluation::{Calculation, CalculationInfo, ValueSource};
 use std::{fmt, io, sync::Arc};
 
 /// This is a verifying key which allows for the verification of proofs for a
@@ -454,10 +454,14 @@ where
         let fixed_polys = read_polynomial_vec(reader, format)?;
         let fixed_cosets = read_polynomial_vec(reader, format)?;
 
-        let icicle_fixed = device_vec_from_poly_vec::<C, ExtendedLagrangeCoeff>(&fixed_cosets, &IcicleStream::default());
+        let icicle_fixed = device_vec_from_poly_vec::<C, ExtendedLagrangeCoeff>(
+            &fixed_cosets,
+            &IcicleStream::default(),
+        );
         let icicle_l0 = device_vec_from_c_scalars(&l0.as_ref(), &IcicleStream::default());
         let icicle_l_last = device_vec_from_c_scalars(&l_last.as_ref(), &IcicleStream::default());
-        let icicle_l_active_row = device_vec_from_c_scalars(&l_active_row.as_ref(), &IcicleStream::default());
+        let icicle_l_active_row =
+            device_vec_from_c_scalars(&l_active_row.as_ref(), &IcicleStream::default());
 
         let permutation = permutation::ProvingKey::read(reader, format)?;
         let ev = Evaluator::new(vk.cs());

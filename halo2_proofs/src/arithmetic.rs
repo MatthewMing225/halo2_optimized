@@ -32,9 +32,7 @@ where
 }
 
 /// Best MSM
-pub fn best_multiexp<C: CurveAffine>(
-    coeffs: &[C::Scalar], bases: &[C]
-) -> C::Curve {
+pub fn best_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
     best_multiexp_cpu(coeffs, bases)
 }
 
@@ -49,7 +47,11 @@ pub fn best_multiexp_cpu<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C
 }
 
 /// Performs a multi-exponentiation operation on GPU using Icicle library
-pub fn best_multiexp_gpu<C: CurveAffine>(coeffs: &[C::Scalar], g: &DeviceSlice<Affine<CurveCfg>>, stream: &IcicleStream) -> C::Curve {
+pub fn best_multiexp_gpu<C: CurveAffine>(
+    coeffs: &[C::Scalar],
+    g: &DeviceSlice<Affine<CurveCfg>>,
+    stream: &IcicleStream,
+) -> C::Curve {
     icicle::multiexp_on_device::<C>(coeffs, g, stream)
 }
 
@@ -61,8 +63,7 @@ pub fn best_fft<Scalar: Field + ff::PrimeField, G: FftGroup<Scalar> + ff::PrimeF
     data: &FFTData<Scalar>,
     inverse: bool,
 ) {
-    if !icicle::should_use_cpu_fft(scalars.len()) && icicle::is_gpu_supported_field(&omega)
-    {
+    if !icicle::should_use_cpu_fft(scalars.len()) && icicle::is_gpu_supported_field(&omega) {
         icicle::fft_on_device::<Scalar, G>(scalars, inverse, &IcicleStream::default());
     } else {
         fft::fft(scalars, omega, log_n, data, inverse);

@@ -1,8 +1,5 @@
 use ff::PrimeField;
-use group::{
-    ff::Field,
-    Curve,
-};
+use group::{ff::Field, Curve};
 use icicle_runtime::stream::IcicleStream;
 use rand_core::RngCore;
 use std::iter::{self, ExactSizeIterator};
@@ -10,10 +7,14 @@ use std::iter::{self, ExactSizeIterator};
 use super::super::{circuit::Any, ChallengeBeta, ChallengeGamma, ChallengeX};
 use super::{Argument, ProvingKey};
 use crate::{
-    arithmetic::{eval_polynomial, parallelize, CurveAffine}, icicle::icicle_invert, plonk::{self, Error}, poly::{
+    arithmetic::{eval_polynomial, parallelize, CurveAffine},
+    icicle::icicle_invert,
+    plonk::{self, Error},
+    poly::{
         commitment::{Blind, Params},
         Coeff, ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, ProverQuery, Rotation,
-    }, transcript::{EncodedChallenge, TranscriptWrite}
+    },
+    transcript::{EncodedChallenge, TranscriptWrite},
 };
 
 pub(crate) struct CommittedSet<C: CurveAffine> {
@@ -165,18 +166,18 @@ impl Argument {
             last_z = z[params.n() as usize - (blinding_factors + 1)];
 
             let blind = Blind(C::Scalar::random(&mut rng));
-            let permutation_product_commitment_projective = params.commit_lagrange_with_stream(&z, blind, &stream);
+            let permutation_product_commitment_projective =
+                params.commit_lagrange_with_stream(&z, blind, &stream);
             let permutation_product_blind = blind;
             let z = domain.lagrange_to_coeff_stream(z, &stream);
             let permutation_product_poly = z.clone();
             let permutation_product_coset = domain.coeff_to_extended(&z, &stream);
-            
+
             stream.synchronize().unwrap();
             stream.destroy().unwrap();
 
             let permutation_product_commitment =
                 permutation_product_commitment_projective.to_affine();
-
 
             // Hash the permutation product commitment
             transcript.write_point(permutation_product_commitment)?;

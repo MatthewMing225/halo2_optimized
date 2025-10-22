@@ -344,15 +344,16 @@ impl<C: CurveAffine> Permuted<C> {
         }
 
         let product_blind = Blind(C::Scalar::random(rng));
-        let product_commitment = params.commit_lagrange_with_stream(&z, product_blind, &stream).to_affine();
+        let product_commitment = params
+            .commit_lagrange_with_stream(&z, product_blind, &stream)
+            .to_affine();
         let z = pk.vk.domain.lagrange_to_coeff_stream(z, &stream);
 
         stream.synchronize().unwrap();
         stream.destroy().unwrap();
-        
+
         // Hash product commitment
         transcript.write_point(product_commitment)?;
-
 
         Ok(Committed::<C> {
             permuted_input_poly: self.permuted_input_poly,

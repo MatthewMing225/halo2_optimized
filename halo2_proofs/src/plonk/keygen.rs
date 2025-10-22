@@ -3,10 +3,13 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::{
+    icicle::{device_vec_from_c_scalars, device_vec_from_poly_vec},
+    poly::ExtendedLagrangeCoeff,
+};
 use ff::{Field, FromUniformBytes};
 use group::Curve;
 use icicle_runtime::stream::IcicleStream;
-use crate::{icicle::{device_vec_from_c_scalars, device_vec_from_poly_vec}, poly::ExtendedLagrangeCoeff};
 
 use super::{
     circuit::{
@@ -17,11 +20,13 @@ use super::{
     permutation, Assigned, Challenge, Error, LagrangeCoeff, Polynomial, ProvingKey, VerifyingKey,
 };
 use crate::{
-    arithmetic::{parallelize, CurveAffine}, circuit::Value, poly::{
+    arithmetic::{parallelize, CurveAffine},
+    circuit::Value,
+    poly::{
         batch_invert_assigned,
         commitment::{Blind, Params},
         EvaluationDomain,
-    }
+    },
 };
 
 pub(crate) fn create_domain<C, ConcreteCircuit>(
@@ -377,14 +382,18 @@ where
         *evaluation = C::Scalar::ONE;
     }
     let l_blind = vk.domain.lagrange_to_coeff(l_blind);
-    let l_blind = vk.domain.coeff_to_extended(&l_blind, &IcicleStream::default());
+    let l_blind = vk
+        .domain
+        .coeff_to_extended(&l_blind, &IcicleStream::default());
 
     // Compute l_last(X) which evaluates to 1 on the first inactive row (just
     // before the blinding factors) and 0 otherwise over the domain
     let mut l_last = vk.domain.empty_lagrange();
     l_last[params.n() as usize - cs.blinding_factors() - 1] = C::Scalar::ONE;
     let l_last = vk.domain.lagrange_to_coeff(l_last);
-    let l_last = vk.domain.coeff_to_extended(&l_last, &IcicleStream::default());
+    let l_last = vk
+        .domain
+        .coeff_to_extended(&l_last, &IcicleStream::default());
 
     // Compute l_active_row(X)
     let one = C::Scalar::ONE;
@@ -399,10 +408,14 @@ where
     // Compute the optimized evaluation data structure
     let ev = Evaluator::new(&vk.cs);
 
-    let icicle_fixed = device_vec_from_poly_vec::<C, ExtendedLagrangeCoeff>(&fixed_cosets, &IcicleStream::default());
+    let icicle_fixed = device_vec_from_poly_vec::<C, ExtendedLagrangeCoeff>(
+        &fixed_cosets,
+        &IcicleStream::default(),
+    );
     let icicle_l0 = device_vec_from_c_scalars(&l0.as_ref(), &IcicleStream::default());
     let icicle_l_last = device_vec_from_c_scalars(&l_last.as_ref(), &IcicleStream::default());
-    let icicle_l_active_row = device_vec_from_c_scalars(&l_active_row.as_ref(), &IcicleStream::default());
+    let icicle_l_active_row =
+        device_vec_from_c_scalars(&l_active_row.as_ref(), &IcicleStream::default());
 
     Ok(ProvingKey {
         vk,

@@ -11,13 +11,13 @@ use icicle_bn254::curve::ScalarField;
 use icicle_core::ntt::release_domain;
 
 use halo2_proofs::{
+    icicle::try_load_and_set_backend_device,
     poly::kzg::{
         commitment::{KZGCommitmentScheme, ParamsKZG},
         multiopen::{ProverGWC, VerifierGWC},
         strategy::SingleStrategy,
     },
     transcript::{TranscriptReadBuffer, TranscriptWriterBuffer},
-    icicle::try_load_and_set_backend_device
 };
 use icicle_runtime::{stream::IcicleStream, warmup};
 
@@ -159,22 +159,12 @@ impl<FF: Field> StandardCs<FF> for StandardPlonk<FF> {
                 region.assign_fixed(|| "a", self.config.sa, 0, || Value::known(FF::ONE))?;
                 region.assign_fixed(|| "b", self.config.sb, 0, || Value::known(FF::ONE))?;
                 region.assign_fixed(|| "c", self.config.sc, 0, || Value::known(FF::ONE))?;
-                region.assign_fixed(
-                    || "a * b",
-                    self.config.sm,
-                    0,
-                    || Value::known(FF::ZERO),
-                )?;
+                region.assign_fixed(|| "a * b", self.config.sm, 0, || Value::known(FF::ZERO))?;
                 Ok((lhs.cell(), rhs.cell(), out.cell()))
             },
         )
     }
-    fn copy(
-        &self,
-        layouter: &mut impl Layouter<FF>,
-        left: Cell,
-        right: Cell,
-    ) -> Result<(), Error> {
+    fn copy(&self, layouter: &mut impl Layouter<FF>, left: Cell, right: Cell) -> Result<(), Error> {
         layouter.assign_region(|| "copy", |mut region| region.constrain_equal(left, right))
     }
 }
@@ -232,11 +222,7 @@ impl<F: Field> Circuit<F> for MyCircuit<F> {
         }
     }
 
-    fn synthesize(
-        &self,
-        config: PlonkConfig,
-        mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    fn synthesize(&self, config: PlonkConfig, mut layouter: impl Layouter<F>) -> Result<(), Error> {
         let cs = StandardPlonk::new(config);
 
         for _ in 0..((1 << (self.k - 1)) - 3) {
@@ -301,14 +287,7 @@ fn verifier(params: &ParamsKZG<Bn256>, vk: &VerifyingKey<G1Affine>, proof: &[u8]
         Challenge255<G1Affine>,
         Blake2bRead<&[u8], G1Affine, Challenge255<G1Affine>>,
         SingleStrategy<'_, Bn256>,
-    >(
-        params,
-        vk,
-        strategy,
-        &[&[]],
-        &mut transcript,
-        params.n()
-    )
+    >(params, vk, strategy, &[&[]], &mut transcript, params.n())
     .is_ok());
 }
 
@@ -317,7 +296,7 @@ fn main() {
 
     try_load_and_set_backend_device("CUDA");
     warmup(&IcicleStream::default()).unwrap();
-    
+
     for k in 10..20 {
         release_domain::<ScalarField>().unwrap();
 

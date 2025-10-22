@@ -5,13 +5,12 @@ use rand_core::RngCore;
 use rustc_hash::FxBuildHasher;
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
-use std::collections::BTreeSet;
 use std::iter;
 use std::ops::RangeTo;
 
 use super::{
     circuit::{
-        sealed::{self},
+        sealed::{self, Phase},
         Advice, Any, Assignment, Challenge, Circuit, Column, ConstraintSystem, Fixed, FloorPlanner,
         Instance, Selector,
     },
@@ -32,6 +31,7 @@ use maybe_rayon::iter::{IntoParallelIterator, IntoParallelRefIterator};
 use crate::{
     arithmetic::{eval_polynomial, CurveAffine},
     circuit::Value,
+    plonk::evaluation::EvaluateHOutput,
     plonk::Assigned,
     poly::{
         commitment::{Blind, CommitmentScheme, Params, Prover},
@@ -91,7 +91,7 @@ where
     let start = Instant::now();
     // Hash verification key into transcript
     pk.vk.hash_into(transcript)?;
-    log::trace!("Hashing verification key: {:?}", start.elapsed());
+    log::info!("Hashing verification key: {:?}", start.elapsed());
 
     let domain = &pk.vk.domain;
     let mut meta = ConstraintSystem::default();
@@ -327,26 +327,40 @@ where
         let mut challenges =
             HashMap::<usize, Scheme::Scalar>::with_capacity_and_hasher(meta.num_challenges, s);
         let unusable_rows_start = params.n() as usize - (meta.blinding_factors() + 1);
-        for current_phase in pk.vk.cs.phases() {
-            let _start = Instant::now();
-            let column_indices = meta
-                .advice_column_phase
-                .iter()
-                .enumerate()
-                .filter_map(|(column_index, phase)| {
-                    if current_phase == *phase {
-                        Some(column_index)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<BTreeSet<_>>();
+        let phase_column_indices: Vec<(Phase, Vec<usize>)> = pk
+            .vk
+            .cs
+            .phases()
+            .into_iter()
+            .map(|phase| {
+                let mut cols: Vec<usize> = meta
+                    .advice_column_phase
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(column_index, current)| {
+                        if phase == *current {
+                            Some(column_index)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                cols.sort_unstable();
+                (phase, cols)
+            })
+            .collect();
+
+        for (current_phase, column_indices) in phase_column_indices.iter() {
+            let phase_start = Instant::now();
+            log::info!("advice phase {:?} started", current_phase);
+            let column_indices_set: HashSet<usize> = column_indices.iter().copied().collect();
             for ((circuit, advice), instances) in
                 circuits.iter().zip(advice.iter_mut()).zip(instances)
             {
+                let synth_start = Instant::now();
                 let mut witness = WitnessCollection {
                     k: params.k(),
-                    current_phase,
+                    current_phase: *current_phase,
                     advice: vec![domain.empty_lagrange_assigned(); meta.num_advice_columns],
                     unblinded_advice: HashSet::from_iter(meta.unblinded_advice_columns.clone()),
                     instances,
@@ -366,6 +380,11 @@ where
                     config.clone(),
                     meta.constants.clone(),
                 )?;
+                log::info!(
+                    "witness generation for phase {:?} took {:.3?}",
+                    current_phase,
+                    synth_start.elapsed()
+                );
 
                 let mut advice_values = batch_invert_assigned::<Scheme::Scalar>(
                     witness
@@ -373,7 +392,7 @@ where
                         .into_iter()
                         .enumerate()
                         .filter_map(|(column_index, advice)| {
-                            if column_indices.contains(&column_index) {
+                            if column_indices_set.contains(&column_index) {
                                 Some(advice)
                             } else {
                                 None
@@ -430,14 +449,30 @@ where
                     advice.advice_polys[*column_index] = advice_values;
                     advice.advice_blinds[*column_index] = blind;
                 }
+                log::info!(
+                    "advice commitment work for circuit/phase {:?} took {:.3?}",
+                    current_phase,
+                    synth_start.elapsed()
+                );
             }
             for (index, phase) in meta.challenge_phase.iter().enumerate() {
-                if current_phase == *phase {
+                if *current_phase == *phase {
+                    let challenge_start = Instant::now();
                     let existing =
                         challenges.insert(index, *transcript.squeeze_challenge_scalar::<()>());
                     assert!(existing.is_none());
+                    log::info!(
+                        "challenge {:?} sampling took {:.3?}",
+                        index,
+                        challenge_start.elapsed()
+                    );
                 }
             }
+            log::info!(
+                "advice phase {:?} completed in {:.3?}",
+                current_phase,
+                phase_start.elapsed()
+            );
         }
 
         assert_eq!(challenges.len(), meta.num_challenges);
@@ -639,7 +674,10 @@ where
         )
         .collect();
 
-    let h_poly = pk.ev.evaluate_h(
+    let EvaluateHOutput {
+        host_poly: h_poly,
+        device_values: h_device_values,
+    } = pk.ev.evaluate_h(
         pk,
         &advice
             .iter()
@@ -659,13 +697,27 @@ where
         &permutations,
     );
 
-    let vanishing = vanishing.construct(params, domain, h_poly, &mut rng, transcript)?;
+    let post_eval_start = Instant::now();
+    log::info!("post-evaluate_h phase: begin");
+    let vanishing = vanishing.construct(
+        params,
+        domain,
+        h_poly,
+        Some(h_device_values),
+        &mut rng,
+        transcript,
+    )?;
+    log::info!(
+        "post-evaluate_h phase: vanishing::construct completed in {:.3?}",
+        post_eval_start.elapsed()
+    );
 
     let x: ChallengeX<_> = transcript.squeeze_challenge_scalar();
     let xn = x.pow([params.n()]);
 
     if P::QUERY_INSTANCE {
         // Compute and hash instance evals for each circuit instance
+        let instance_eval_start = Instant::now();
         for instance in instance.iter() {
             // Evaluate polynomials at omega^i x
             let instance_evals: Vec<_> = meta
@@ -684,9 +736,14 @@ where
                 transcript.write_scalar(*eval)?;
             }
         }
+        log::info!(
+            "post-evaluate_h phase: instance evaluations completed in {:.3?}",
+            instance_eval_start.elapsed()
+        );
     }
 
     // Compute and hash advice evals for each circuit instance
+    let advice_eval_start = Instant::now();
     for advice in advice.iter() {
         // Evaluate polynomials at omega^i x
         let advice_evals: Vec<_> = meta
@@ -705,8 +762,13 @@ where
             transcript.write_scalar(*eval)?;
         }
     }
+    log::info!(
+        "post-evaluate_h phase: advice evaluations completed in {:.3?}",
+        advice_eval_start.elapsed()
+    );
 
     // Compute and hash fixed evals (shared across all circuit instances)
+    let fixed_eval_start = Instant::now();
     let fixed_evals: Vec<_> = meta
         .fixed_queries
         .par_iter()
@@ -714,25 +776,44 @@ where
             eval_polynomial(&pk.fixed_polys[column.index()], domain.rotate_omega(*x, at))
         })
         .collect();
-
+    log::info!(
+        "post-evaluate_h phase: fixed evaluations completed in {:.3?}",
+        fixed_eval_start.elapsed()
+    );
     // Hash each fixed column evaluation
     for eval in fixed_evals.iter() {
         transcript.write_scalar(*eval)?;
     }
 
+    let vanishing_eval_start = Instant::now();
     let vanishing = vanishing.evaluate(x, xn, domain, transcript)?;
+    log::info!(
+        "post-evaluate_h phase: vanishing::evaluate completed in {:.3?}",
+        vanishing_eval_start.elapsed()
+    );
 
     // Evaluate common permutation data
+    let permutation_eval_start = Instant::now();
     pk.permutation.evaluate(x, transcript)?;
+    log::info!(
+        "post-evaluate_h phase: permutation common evaluation completed in {:.3?}",
+        permutation_eval_start.elapsed()
+    );
 
     // Evaluate the permutations, if any, at omega^i x.
+    let permutations_eval_start = Instant::now();
     let permutations: Vec<permutation::prover::Evaluated<Scheme::Curve>> = permutations
         .into_iter()
         .map(|permutation| -> Result<_, _> { permutation.construct().evaluate(pk, x, transcript) })
         .collect::<Result<Vec<_>, _>>()?;
+    log::info!(
+        "post-evaluate_h phase: permutation evaluations completed in {:.3?}",
+        permutations_eval_start.elapsed()
+    );
 
     // Evaluate the lookups, if any, at omega^i x.
 
+    let lookups_eval_start = Instant::now();
     let lookups: Vec<Vec<lookup::prover::Evaluated<Scheme::Curve>>> = lookups
         .into_iter()
         .map(|lookups| -> Result<Vec<_>, _> {
@@ -748,8 +829,13 @@ where
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
+    log::info!(
+        "post-evaluate_h phase: lookup evaluations completed in {:.3?}",
+        lookups_eval_start.elapsed()
+    );
 
     // Evaluate the shuffles, if any, at omega^i x.
+    let shuffles_eval_start = Instant::now();
     let shuffles: Vec<Vec<shuffle::prover::Evaluated<Scheme::Curve>>> = shuffles
         .into_iter()
         .map(|shuffles| -> Result<Vec<_>, _> {
@@ -759,6 +845,10 @@ where
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
+    log::info!(
+        "post-evaluate_h phase: shuffle evaluations completed in {:.3?}",
+        shuffles_eval_start.elapsed()
+    );
 
     let instances = instance
         .iter()
@@ -823,9 +913,21 @@ where
     }
 
     let prover = P::new(params);
+    let multi_open_start = Instant::now();
     prover
         .create_proof(rng, transcript, instances)
         .map_err(|_| Error::ConstraintSystemFailure)
+        .map(|res| {
+            log::info!(
+                "post-evaluate_h phase: multi-open proof generation completed in {:.3?}",
+                multi_open_start.elapsed()
+            );
+            log::info!(
+                "post-evaluate_h phase: total tail completed in {:.3?}",
+                post_eval_start.elapsed()
+            );
+            res
+        })
 }
 
 #[test]

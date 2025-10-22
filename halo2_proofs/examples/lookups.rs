@@ -12,13 +12,13 @@ use icicle_runtime::{stream::IcicleStream, warmup};
 use rand_core::OsRng;
 
 use halo2_proofs::{
+    icicle::try_load_and_set_backend_device,
     poly::kzg::{
         commitment::{KZGCommitmentScheme, ParamsKZG},
         multiopen::ProverGWC,
         strategy::SingleStrategy,
     },
     transcript::{TranscriptReadBuffer, TranscriptWriterBuffer},
-    icicle::try_load_and_set_backend_device
 };
 
 use std::marker::PhantomData;
@@ -103,11 +103,7 @@ impl<F: PrimeField> Circuit<F> for MyCircuit<F> {
         config
     }
 
-    fn synthesize(
-        &self,
-        config: MyConfig,
-        mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    fn synthesize(&self, config: MyConfig, mut layouter: impl Layouter<F>) -> Result<(), Error> {
         layouter.assign_table(
             || "8-bit table",
             |mut table| {
@@ -199,7 +195,7 @@ fn main() {
 
     try_load_and_set_backend_device("CUDA");
     warmup(&IcicleStream::default()).unwrap();
-    
+
     for k in 11..20 {
         release_domain::<ScalarField>().unwrap();
 

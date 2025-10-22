@@ -14,12 +14,12 @@ use rand_core::{OsRng, RngCore};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
-use std::{fmt, io};
 use icicle_bn254::curve::CurveCfg;
 use icicle_core::curve::Affine;
 use icicle_runtime::memory::{DeviceVec, HostSlice};
 use icicle_runtime::stream::IcicleStream;
 use std::sync::Arc;
+use std::{fmt, io};
 
 use super::msm::MSMKZG;
 
@@ -143,14 +143,19 @@ where
         let g2 = <E::G2Affine as PrimeCurveAffine>::generator();
         let s_g2 = (g2 * s).into();
 
-        let mut gpu_g_lagrange: DeviceVec<Affine<CurveCfg>> = DeviceVec::device_malloc(g_lagrange.len()).unwrap();
+        let mut gpu_g_lagrange: DeviceVec<Affine<CurveCfg>> =
+            DeviceVec::device_malloc(g_lagrange.len()).unwrap();
         let mut gpu_g: DeviceVec<Affine<CurveCfg>> = DeviceVec::device_malloc(g.len()).unwrap();
-        
+
         let converted_g_lagrange = icicle_points_from_c(&g_lagrange[..]);
-        gpu_g_lagrange.copy_from_host(HostSlice::from_slice(&converted_g_lagrange[..])).unwrap();
+        gpu_g_lagrange
+            .copy_from_host(HostSlice::from_slice(&converted_g_lagrange[..]))
+            .unwrap();
 
         let converted_g = icicle_points_from_c(&g[..]);
-        gpu_g.copy_from_host(HostSlice::from_slice(&converted_g[..])).unwrap();
+        gpu_g
+            .copy_from_host(HostSlice::from_slice(&converted_g[..]))
+            .unwrap();
 
         Self {
             k,
@@ -185,14 +190,19 @@ where
             None => g_to_lagrange(g.iter().map(PrimeCurveAffine::to_curve).collect(), k),
         };
 
-        let mut gpu_g_lagrange: DeviceVec<Affine<CurveCfg>> = DeviceVec::device_malloc(g_lagrange.len()).unwrap();
+        let mut gpu_g_lagrange: DeviceVec<Affine<CurveCfg>> =
+            DeviceVec::device_malloc(g_lagrange.len()).unwrap();
         let mut gpu_g: DeviceVec<Affine<CurveCfg>> = DeviceVec::device_malloc(g.len()).unwrap();
-        
+
         let converted_g_lagrange = icicle_points_from_c(&g_lagrange[..]);
-        gpu_g_lagrange.copy_from_host(HostSlice::from_slice(&converted_g_lagrange[..])).unwrap();
+        gpu_g_lagrange
+            .copy_from_host(HostSlice::from_slice(&converted_g_lagrange[..]))
+            .unwrap();
 
         let converted_g = icicle_points_from_c(&g[..]);
-        gpu_g.copy_from_host(HostSlice::from_slice(&converted_g[..])).unwrap();
+        gpu_g
+            .copy_from_host(HostSlice::from_slice(&converted_g[..]))
+            .unwrap();
 
         Self {
             k,
@@ -309,14 +319,19 @@ where
         let g2 = E::G2Affine::read(reader, format)?;
         let s_g2 = E::G2Affine::read(reader, format)?;
 
-        let mut gpu_g_lagrange: DeviceVec<Affine<CurveCfg>> = DeviceVec::device_malloc(g_lagrange.len()).unwrap();
+        let mut gpu_g_lagrange: DeviceVec<Affine<CurveCfg>> =
+            DeviceVec::device_malloc(g_lagrange.len()).unwrap();
         let mut gpu_g: DeviceVec<Affine<CurveCfg>> = DeviceVec::device_malloc(g.len()).unwrap();
-        
+
         let converted_g_lagrange = icicle_points_from_c(&g_lagrange[..]);
-        gpu_g_lagrange.copy_from_host(HostSlice::from_slice(&converted_g_lagrange[..])).unwrap();
+        gpu_g_lagrange
+            .copy_from_host(HostSlice::from_slice(&converted_g_lagrange[..]))
+            .unwrap();
 
         let converted_g = icicle_points_from_c(&g[..]);
-        gpu_g.copy_from_host(HostSlice::from_slice(&converted_g[..])).unwrap();
+        gpu_g
+            .copy_from_host(HostSlice::from_slice(&converted_g[..]))
+            .unwrap();
 
         Ok(Self {
             k,
@@ -367,17 +382,26 @@ where
     }
 
     fn commit_lagrange(&self, poly: &Polynomial<E::Fr, LagrangeCoeff>, _: Blind<E::Fr>) -> E::G1 {
-        let mut scalars: Vec<E::Fr>  = Vec::with_capacity(poly.len());
+        let mut scalars: Vec<E::Fr> = Vec::with_capacity(poly.len());
         scalars.extend(poly.iter());
         let bases = &self.g_lagrange;
         let size = scalars.len();
         assert!(bases.len() >= size);
 
-        best_multiexp_gpu::<E::G1Affine>(&scalars, &self.gpu_g_lagrange[0..size], &IcicleStream::default())
+        best_multiexp_gpu::<E::G1Affine>(
+            &scalars,
+            &self.gpu_g_lagrange[0..size],
+            &IcicleStream::default(),
+        )
     }
 
-    fn commit_lagrange_with_stream(&self, poly: &Polynomial<E::Fr, LagrangeCoeff>, _: Blind<E::Fr>, stream: &IcicleStream) -> E::G1 {
-        let mut scalars: Vec<E::Fr>  = Vec::with_capacity(poly.len());
+    fn commit_lagrange_with_stream(
+        &self,
+        poly: &Polynomial<E::Fr, LagrangeCoeff>,
+        _: Blind<E::Fr>,
+        stream: &IcicleStream,
+    ) -> E::G1 {
+        let mut scalars: Vec<E::Fr> = Vec::with_capacity(poly.len());
         scalars.extend(poly.iter());
         let bases = &self.g_lagrange;
         let size = scalars.len();

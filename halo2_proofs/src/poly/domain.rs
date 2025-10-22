@@ -2,7 +2,10 @@
 //! domain that is of a suitable size for the application.
 
 use crate::{
-    arithmetic::{best_fft, parallelize}, fft::recursive::FFTData, icicle::{fft_on_device, fft_on_device_vec, icicle_scalars_from_c_scalars}, plonk::Assigned
+    arithmetic::{best_fft, parallelize},
+    fft::recursive::FFTData,
+    icicle::{fft_on_device, fft_on_device_vec, icicle_scalars_from_c_scalars},
+    plonk::Assigned,
 };
 
 use super::{Coeff, ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, Rotation};
@@ -329,7 +332,11 @@ impl<F: WithSmallOrderMulGroup<3>> EvaluationDomain<F> {
     }
 
     ///stream
-    pub fn lagrange_to_coeff_stream(&self, mut a: Polynomial<F, LagrangeCoeff>, stream: &IcicleStream) -> Polynomial<F, Coeff> {
+    pub fn lagrange_to_coeff_stream(
+        &self,
+        mut a: Polynomial<F, LagrangeCoeff>,
+        stream: &IcicleStream,
+    ) -> Polynomial<F, Coeff> {
         assert_eq!(a.values.len(), 1 << self.k);
 
         // Perform inverse FFT to obtain the polynomial in coefficient form
@@ -649,6 +656,50 @@ impl<F: WithSmallOrderMulGroup<3>> EvaluationDomain<F> {
     /// Get the size of the extended domain
     pub fn extended_len(&self) -> usize {
         1 << self.extended_k
+    }
+
+    pub(crate) fn base_len(&self) -> usize {
+        self.n as usize
+    }
+
+    pub(crate) fn quotient_poly_len(&self) -> usize {
+        (self.n * self.quotient_poly_degree) as usize
+    }
+
+    pub(crate) fn repeated_vanishing_evals(&self) -> Vec<F> {
+        if self.t_evaluations.is_empty() {
+            return Vec::new();
+        }
+
+        let mut result = Vec::with_capacity(self.extended_len());
+        for _ in 0..self.base_len() {
+            result.extend(self.t_evaluations.iter().cloned());
+        }
+        result
+    }
+
+    pub(crate) fn coset_scaling_factors(&self, into_coset: bool) -> Vec<F> {
+        let coset_powers = if into_coset {
+            [self.g_coset, self.g_coset_inv]
+        } else {
+            [self.g_coset_inv, self.g_coset]
+        };
+
+        if self.extended_len() == 0 {
+            return Vec::new();
+        }
+
+        let mut factors = Vec::with_capacity(self.extended_len());
+        let cycle = coset_powers.len() + 1;
+        for index in 0..self.extended_len() {
+            let pos = index % cycle;
+            if pos == 0 {
+                factors.push(F::ONE);
+            } else {
+                factors.push(coset_powers[pos - 1]);
+            }
+        }
+        factors
     }
 
     /// Get $\omega$, the generator of the $2^k$ order multiplicative subgroup.

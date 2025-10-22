@@ -14,17 +14,17 @@ use icicle_runtime::{stream::IcicleStream, warmup};
 use rand_core::OsRng;
 
 use halo2_proofs::{
+    icicle::try_load_and_set_backend_device,
     poly::kzg::{
         commitment::{KZGCommitmentScheme, ParamsKZG},
         multiopen::ProverGWC,
         strategy::SingleStrategy,
     },
     transcript::{TranscriptReadBuffer, TranscriptWriterBuffer},
-    icicle::try_load_and_set_backend_device
 };
 
 use std::marker::PhantomData;
-use std::time::{Instant};
+use std::time::Instant;
 
 #[derive(Clone, Default)]
 struct MyCircuit<F: PrimeField> {
@@ -109,11 +109,7 @@ impl<F: PrimeField> Circuit<F> for MyCircuit<F> {
         config
     }
 
-    fn synthesize(
-        &self,
-        config: MyConfig,
-        mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    fn synthesize(&self, config: MyConfig, mut layouter: impl Layouter<F>) -> Result<(), Error> {
         layouter.assign_table(
             || "8-bit 2x table",
             |mut table| {
@@ -160,12 +156,7 @@ impl<F: PrimeField> Circuit<F> for MyCircuit<F> {
 
                     let output_offset = offset + 2_u64.pow(self.k - 2);
                     // copy it further down
-                    cell.copy_advice(
-                        || "",
-                        &mut region,
-                        config.advice,
-                        output_offset as usize,
-                    )?;
+                    cell.copy_advice(|| "", &mut region, config.advice, output_offset as usize)?;
                     // now make it public
                     region.assign_advice_from_instance(
                         || "pub input anchor",
@@ -189,7 +180,7 @@ fn keygen(k: u32) -> (ParamsKZG<Bn256>, ProvingKey<G1Affine>) {
     let params: ParamsKZG<Bn256> = ParamsKZG::new(k);
     let empty_circuit: MyCircuit<Fr> = MyCircuit {
         _marker: PhantomData,
-        k
+        k,
     };
     let vk = keygen_vk(&params, &empty_circuit).expect("keygen_vk should not fail");
     let pk = keygen_pk(&params, vk, &empty_circuit).expect("keygen_pk should not fail");
@@ -253,7 +244,7 @@ fn main() {
 
     try_load_and_set_backend_device("CUDA");
     warmup(&IcicleStream::default()).unwrap();
-    
+
     for k in 10..20 {
         release_domain::<ScalarField>().unwrap();
 

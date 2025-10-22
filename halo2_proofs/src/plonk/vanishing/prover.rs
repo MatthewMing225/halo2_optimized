@@ -1,16 +1,28 @@
 use ff::Field;
 use group::Curve;
+use log::{debug, warn};
 use maybe_rayon::iter::IndexedParallelIterator;
 use maybe_rayon::iter::IntoParallelRefIterator;
 use maybe_rayon::iter::ParallelIterator;
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 use rustc_hash::FxHashMap as HashMap;
-use std::iter;
+use std::{env, iter};
+
+use icicle_bn254::curve::ScalarField;
+use icicle_core::{
+    ntt::{ntt_inplace, NTTConfig, NTTDir},
+    vec_ops::{mul_scalars, VecOpsConfig},
+};
+use icicle_runtime::{
+    memory::{DeviceSlice, DeviceVec, HostOrDeviceSlice},
+    stream::IcicleStream,
+};
 
 use super::Argument;
 use crate::{
     arithmetic::{eval_polynomial, parallelize, CurveAffine},
+    icicle::{c_scalars_from_device_vec, device_vec_from_c_scalars},
     multicore::current_num_threads,
     plonk::{ChallengeX, Error},
     poly::{
@@ -25,15 +37,25 @@ pub(in crate::plonk) struct Committed<C: CurveAffine> {
     random_blind: Blind<C::Scalar>,
 }
 
+#[allow(dead_code)]
+pub(crate) struct VanishingDeviceData {
+    pub quotient: DeviceVec<ScalarField>,
+    pub piece_len: usize,
+    pub num_pieces: usize,
+}
+
 pub(in crate::plonk) struct Constructed<C: CurveAffine> {
     h_pieces: Vec<Polynomial<C::Scalar, Coeff>>,
     h_blinds: Vec<Blind<C::Scalar>>,
+    device: Option<VanishingDeviceData>,
     committed: Committed<C>,
 }
 
 pub(in crate::plonk) struct Evaluated<C: CurveAffine> {
     h_poly: Polynomial<C::Scalar, Coeff>,
     h_blind: Blind<C::Scalar>,
+    #[allow(dead_code)]
+    device: Option<VanishingDeviceData>,
     committed: Committed<C>,
 }
 
@@ -97,6 +119,213 @@ impl<C: CurveAffine> Argument<C> {
 }
 
 impl<C: CurveAffine> Committed<C> {
+    fn reset_active_device() {
+        if let Ok(device_type) = env::var("ICICLE_DEVICE_TYPE") {
+            let device = icicle_runtime::Device::new(device_type.as_str(), 0);
+            if let Err(err) = icicle_runtime::runtime::set_device(&device) {
+                warn!(
+                    "vanishing::construct: failed to reset active device {}: {:?}",
+                    device_type, err
+                );
+            }
+        }
+    }
+
+    fn construct_host_pieces<'params, P: ParamsProver<'params, C> + Send + Sync>(
+        params: &P,
+        domain: &EvaluationDomain<C::Scalar>,
+        h_poly: Polynomial<C::Scalar, ExtendedLagrangeCoeff>,
+    ) -> Vec<Polynomial<C::Scalar, Coeff>> {
+        let h_poly = domain.divide_by_vanishing_poly(h_poly);
+        let h_poly = domain.extended_to_coeff(h_poly);
+
+        h_poly
+            .chunks_exact(params.n() as usize)
+            .map(|v| domain.coeff_from_vec(v.to_vec()))
+            .collect::<Vec<_>>()
+    }
+
+    fn try_construct_with_device<'params, P: ParamsProver<'params, C> + Send + Sync>(
+        params: &P,
+        domain: &EvaluationDomain<C::Scalar>,
+        mut device_values: DeviceVec<ScalarField>,
+    ) -> Result<(Vec<Polynomial<C::Scalar, Coeff>>, VanishingDeviceData), ()> {
+        let enable_gpu = env::var("EZKL_ENABLE_VANISHING_GPU")
+            .map(|val| {
+                let val_lower = val.to_ascii_lowercase();
+                val_lower == "1" || val_lower == "true" || val_lower == "yes"
+            })
+            .unwrap_or(false);
+        if !enable_gpu {
+            debug!("vanishing::construct: device quotient path disabled (set EZKL_ENABLE_VANISHING_GPU=1 to enable)");
+            drop(device_values);
+            return Err(());
+        }
+
+        let stream = IcicleStream::default();
+        match icicle_runtime::runtime::get_active_device() {
+            Ok(device) => {
+                debug!(
+                    "vanishing::construct: active device before GPU path: {}:{}",
+                    device.get_device_type(),
+                    device.id
+                );
+            }
+            Err(err) => {
+                warn!(
+                    "vanishing::construct: failed to fetch active device before GPU path: {:?}",
+                    err
+                );
+            }
+        }
+
+        let result = (|| -> Result<_, ()> {
+            let device_slice = &device_values[..];
+            debug!(
+                "vanishing::construct: h(X) device buffer len={}, on_device={}, on_active={}",
+                device_slice.len(),
+                device_slice.is_on_device(),
+                device_slice.is_on_active_device()
+            );
+
+            let vanishing_factors = domain.repeated_vanishing_evals();
+            if !vanishing_factors.is_empty() {
+                let vanishing_device =
+                    device_vec_from_c_scalars::<C::Scalar>(&vanishing_factors, &stream);
+                let vanishing_slice = &vanishing_device[..];
+                debug!(
+                    "vanishing::construct: vanishing factors len={}, on_device={}, on_active={}",
+                    vanishing_slice.len(),
+                    vanishing_slice.is_on_device(),
+                    vanishing_slice.is_on_active_device()
+                );
+                let mut cfg = VecOpsConfig::default();
+                cfg.stream_handle = (&stream).into();
+                cfg.is_async = false;
+
+                let values_slice_mut = device_values.as_mut_slice();
+                let len = values_slice_mut.len();
+                let values_slice_const = unsafe {
+                    DeviceSlice::from_slice(std::slice::from_raw_parts(
+                        values_slice_mut.as_ptr(),
+                        len,
+                    ))
+                };
+
+                match mul_scalars(
+                    values_slice_const,
+                    &vanishing_device[..],
+                    values_slice_mut,
+                    &cfg,
+                ) {
+                    Ok(_) => {
+                        debug!("vanishing::construct: vanishing multiply completed (sync)");
+                    }
+                    Err(err) => {
+                        warn!("vanishing::construct: vanishing multiply failed: {:?}", err);
+                        Self::reset_active_device();
+                        return Err(());
+                    }
+                }
+            }
+            stream.synchronize().map_err(|err| {
+                warn!(
+                    "vanishing::construct: synchronizing after vanishing multiplication failed: {:?}",
+                    err
+                );
+                Self::reset_active_device();
+            })?;
+
+            let mut cfg = NTTConfig::<ScalarField>::default();
+            cfg.stream_handle = (&stream).into();
+            cfg.is_async = true;
+            ntt_inplace::<ScalarField, ScalarField>(&mut device_values[..], NTTDir::kInverse, &cfg)
+                .map_err(|err| {
+                    warn!(
+                        "vanishing::construct: inverse NTT on device failed: {:?}",
+                        err
+                    );
+                    Self::reset_active_device();
+                })?;
+
+            let coset_scaling = domain.coset_scaling_factors(false);
+            if !coset_scaling.is_empty() {
+                let coset_device = device_vec_from_c_scalars::<C::Scalar>(&coset_scaling, &stream);
+                let coset_slice = &coset_device[..];
+                debug!(
+                    "vanishing::construct: coset factors len={}, on_device={}, on_active={}",
+                    coset_slice.len(),
+                    coset_slice.is_on_device(),
+                    coset_slice.is_on_active_device()
+                );
+
+                let mut cfg = VecOpsConfig::default();
+                cfg.stream_handle = (&stream).into();
+                cfg.is_async = false;
+
+                let values_slice_mut = device_values.as_mut_slice();
+                let len = values_slice_mut.len();
+                let values_slice_const = unsafe {
+                    DeviceSlice::from_slice(std::slice::from_raw_parts(
+                        values_slice_mut.as_ptr(),
+                        len,
+                    ))
+                };
+
+                match mul_scalars(values_slice_const, coset_slice, values_slice_mut, &cfg) {
+                    Ok(_) => {
+                        debug!("vanishing::construct: coset multiply completed (sync)");
+                    }
+                    Err(err) => {
+                        warn!("vanishing::construct: coset multiply failed: {:?}", err);
+                        Self::reset_active_device();
+                        return Err(());
+                    }
+                }
+            }
+
+            stream.synchronize().map_err(|err| {
+                warn!(
+                    "vanishing::construct: synchronizing after coset scaling failed: {:?}",
+                    err
+                );
+                Self::reset_active_device();
+            })?;
+
+            let quotient_len = domain.quotient_poly_len();
+            let mut host_coeffs =
+                c_scalars_from_device_vec::<C::Scalar>(&mut device_values, &stream);
+            host_coeffs.truncate(quotient_len);
+
+            let h_pieces = host_coeffs
+                .chunks_exact(params.n() as usize)
+                .map(|chunk| domain.coeff_from_vec(chunk.to_vec()))
+                .collect::<Vec<_>>();
+
+            let num_pieces = h_pieces.len();
+
+            let quotient_device = device_vec_from_c_scalars::<C::Scalar>(&host_coeffs, &stream);
+            stream.synchronize().map_err(|err| {
+                warn!(
+                    "vanishing::construct: synchronizing after quotient upload failed: {:?}",
+                    err
+                );
+                Self::reset_active_device();
+            })?;
+
+            Ok((
+                h_pieces,
+                VanishingDeviceData {
+                    quotient: quotient_device,
+                    piece_len: params.n() as usize,
+                    num_pieces,
+                },
+            ))
+        })();
+
+        result
+    }
+
     pub(in crate::plonk) fn construct<
         'params,
         P: ParamsProver<'params, C> + Send + Sync,
@@ -108,21 +337,27 @@ impl<C: CurveAffine> Committed<C> {
         params: &P,
         domain: &EvaluationDomain<C::Scalar>,
         h_poly: Polynomial<C::Scalar, ExtendedLagrangeCoeff>,
+        h_poly_device: Option<DeviceVec<ScalarField>>,
         mut rng: R,
         transcript: &mut T,
     ) -> Result<Constructed<C>, Error> {
-        // Divide by t(X) = X^{params.n} - 1.
-        let h_poly = domain.divide_by_vanishing_poly(h_poly);
+        let (h_pieces, device) = match h_poly_device {
+            Some(device_values) => {
+                match Self::try_construct_with_device(params, domain, device_values) {
+                    Ok((pieces, device_data)) => (pieces, Some(device_data)),
+                    Err(_) => {
+                        log::warn!("vanishing::construct: falling back to host path");
+                        let pieces = Self::construct_host_pieces(params, domain, h_poly);
+                        (pieces, None)
+                    }
+                }
+            }
+            None => {
+                let pieces = Self::construct_host_pieces(params, domain, h_poly);
+                (pieces, None)
+            }
+        };
 
-        // Obtain final h(X) polynomial
-        let h_poly = domain.extended_to_coeff(h_poly);
-
-        // Split h(X) up into pieces
-        let h_pieces = h_poly
-            .chunks_exact(params.n() as usize)
-            .map(|v| domain.coeff_from_vec(v.to_vec()))
-            .collect::<Vec<_>>();
-        drop(h_poly);
         let h_blinds: Vec<_> = h_pieces
             .iter()
             .map(|_| Blind(C::Scalar::random(&mut rng)))
@@ -146,6 +381,7 @@ impl<C: CurveAffine> Committed<C> {
         Ok(Constructed {
             h_pieces,
             h_blinds,
+            device,
             committed: self,
         })
     }
@@ -177,6 +413,7 @@ impl<C: CurveAffine> Constructed<C> {
         Ok(Evaluated {
             h_poly,
             h_blind,
+            device: self.device,
             committed: self.committed,
         })
     }

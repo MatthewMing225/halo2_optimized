@@ -7,30 +7,31 @@ use crate::plonk::evaluation::evaluate;
 use crate::SerdeFormat;
 use crate::{
     arithmetic::{eval_polynomial, CurveAffine},
+    icicle::{
+        c_scalars_from_device_vec, device_vec_from_c_scalars, icicle_scalars_from_c_scalars,
+        inplace_add, inplace_invert, inplace_mul, inplace_scalar_add, inplace_sub,
+    },
     poly::{
         commitment::{Blind, Params},
         Coeff, EvaluationDomain, LagrangeCoeff, Polynomial, ProverQuery, Rotation,
     },
     transcript::{EncodedChallenge, TranscriptWrite},
-    icicle::{c_scalars_from_device_vec, device_vec_from_c_scalars, icicle_scalars_from_c_scalars, inplace_add, inplace_invert, inplace_mul, inplace_scalar_add, inplace_sub},
 };
 use ff::WithSmallOrderMulGroup;
-use group::{
-    ff::Field,
-    Curve,
-};
+use group::{ff::Field, Curve};
 use icicle_runtime::{
     memory::{DeviceVec, HostSlice},
     stream::IcicleStream,
 };
-use rustc_hash::FxHashMap as HashMap;
 
-use maybe_rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use maybe_rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+    ParallelSliceMut,
+};
 use std::{
     iter,
     ops::{Mul, MulAssign},
 };
-
 
 #[derive(Debug)]
 pub(in crate::plonk) struct Prepared<C: CurveAffine> {
@@ -121,18 +122,27 @@ impl<F: WithSmallOrderMulGroup<3>> Argument<F> {
         };
 
         let start = instant::Instant::now();
-        // Get values of input expressions involved in the lookup and compress them
+        log::info!(
+            "mv_lookup::prepare: evaluating {} compressed input expressions",
+            self.inputs_expressions.len()
+        );
         let compressed_inputs_expressions: Vec<_> = self
             .inputs_expressions
             .par_iter()
             .map(|input_expressions| compress_expressions(input_expressions))
             .collect();
-        log::trace!("compressed_inputs_expressions {:?}", start.elapsed());
+        log::info!(
+            "mv_lookup::prepare: compressed input expressions computed in {:.3?}",
+            start.elapsed()
+        );
 
         // Get values of table expressions involved in the lookup and compress them
         let start = instant::Instant::now();
         let compressed_table_expression = compress_expressions(&self.table_expressions);
-        log::trace!("compressed_table_expression {:?}", start.elapsed());
+        log::info!(
+            "mv_lookup::prepare: compressed table expression computed in {:.3?}",
+            start.elapsed()
+        );
 
         let blinding_factors = vk.cs.blinding_factors();
 
@@ -140,45 +150,52 @@ impl<F: WithSmallOrderMulGroup<3>> Argument<F> {
 
         // compute m(X)
         let start = instant::Instant::now();
-        let table_index_value_mapping: HashMap<Vec<u8>, usize> = compressed_table_expression
+        log::info!("mv_lookup::prepare: building table index mapping");
+        let mut table_index_value_mapping: Vec<(Vec<u8>, usize)> = compressed_table_expression
             .par_iter()
             .take(chunk_size)
             .enumerate()
             .map(|(i, &x)| (x.to_repr().as_ref().to_owned(), i))
             .collect();
-        log::trace!("table_index_value_mapping {:?}", start.elapsed());
+        table_index_value_mapping.par_sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        log::info!(
+            "mv_lookup::prepare: table index mapping built in {:.3?}",
+            start.elapsed()
+        );
 
         let start = instant::Instant::now();
+        log::info!("mv_lookup::prepare: accumulating m(X)");
         let m_values: Vec<F> = {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            let m_values: Vec<AtomicU64> = (0..params.n()).map(|_| AtomicU64::new(0)).collect();
-
+            let mut counts = vec![0u64; params.n() as usize];
             compressed_inputs_expressions
-                .par_iter()
+                .iter()
                 .for_each(|compressed_input_expression| {
                     compressed_input_expression
                         .iter()
                         .take(chunk_size)
                         .for_each(|fi| {
-                            let index = match table_index_value_mapping
-                                .get(&fi.to_repr().as_ref().to_owned())
+                            let repr = fi.to_repr();
+                            let key = repr.as_ref();
+                            match table_index_value_mapping
+                                .binary_search_by(|(candidate, _)| candidate.as_slice().cmp(key))
                             {
-                                Some(value) => value,
-                                None => {
-                                    log::error!("value is OOR of lookup");
-                                    return;
+                                Ok(pos) => {
+                                    let index = table_index_value_mapping[pos].1;
+                                    counts[index] += 1;
                                 }
-                            };
-                            m_values[*index].fetch_add(1, Ordering::Relaxed);
+                                Err(_) => {
+                                    log::error!("value is OOR of lookup");
+                                }
+                            }
                         });
                 });
 
-            m_values
-                .par_iter()
-                .map(|mi| F::from(mi.load(Ordering::Relaxed)))
-                .collect()
+            counts.into_par_iter().map(F::from).collect()
         };
-        log::trace!("m_values {:?}", start.elapsed());
+        log::info!(
+            "mv_lookup::prepare: m(X) accumulation completed in {:.3?}",
+            start.elapsed()
+        );
         let m_values = vk.domain.lagrange_from_vec(m_values);
 
         #[cfg(feature = "sanity-checks")]
@@ -224,8 +241,13 @@ impl<F: WithSmallOrderMulGroup<3>> Argument<F> {
 
         // commit to m(X)
         let start = instant::Instant::now();
-        let m_commitment = params.commit_lagrange(&m_values, Blind::default()).to_affine();
-        log::trace!("m_commitment {:?}", start.elapsed());
+        let m_commitment = params
+            .commit_lagrange(&m_values, Blind::default())
+            .to_affine();
+        log::info!(
+            "mv_lookup::prepare: m_commitment completed in {:.3?}",
+            start.elapsed()
+        );
 
         // write commitment of m(X) to transcript
         // transcript.write_point(m_commitment)?;
@@ -254,39 +276,51 @@ impl<C: CurveAffine> Prepared<C> {
             RHS = τ(X) * Π(φ_i(X)) * (∑ 1/(φ_i(X)) - m(X) / τ(X))))
         */
 
+        let total_start = instant::Instant::now();
         let start = instant::Instant::now();
+        log::info!("mv_lookup::commit_grand_sum: start");
         let mut stream = IcicleStream::create().unwrap();
         let icicle_beta = device_vec_from_c_scalars(&[*beta], &stream);
 
         // ∑ 1/(φ_i(X))
         let inputs_log_derivatives = vec![C::Scalar::ZERO; params.n() as usize];
-        let mut d_inputs_log_derivatives = device_vec_from_c_scalars(&inputs_log_derivatives, &stream);
+        let mut d_inputs_log_derivatives =
+            device_vec_from_c_scalars(&inputs_log_derivatives, &stream);
         let mut d_temp = DeviceVec::device_malloc(params.n() as usize).unwrap();
         let mut d_m_values = device_vec_from_c_scalars(&self.m_values, &stream);
-        let mut d_compressed_table_expression = device_vec_from_c_scalars(&self.compressed_table_expression, &stream);
-        
+        let mut d_compressed_table_expression =
+            device_vec_from_c_scalars(&self.compressed_table_expression, &stream);
+
         for compressed_input_expression in self.compressed_inputs_expressions.iter() {
-            let icicle_compressed_input_expression = icicle_scalars_from_c_scalars(compressed_input_expression);
-            let h_icicle_compressed_input_expression = HostSlice::from_slice(&icicle_compressed_input_expression);
-            d_temp.copy_from_host_async(h_icicle_compressed_input_expression, &stream).unwrap();
+            let icicle_compressed_input_expression =
+                icicle_scalars_from_c_scalars(compressed_input_expression);
+            let h_icicle_compressed_input_expression =
+                HostSlice::from_slice(&icicle_compressed_input_expression);
+            d_temp
+                .copy_from_host_async(h_icicle_compressed_input_expression, &stream)
+                .unwrap();
 
             inplace_scalar_add(&mut d_temp, &icicle_beta, &stream);
             inplace_invert(&mut d_temp, &stream);
             inplace_add(&mut d_inputs_log_derivatives, &d_temp, &stream);
         }
-        
+
         inplace_scalar_add(&mut d_compressed_table_expression, &icicle_beta, &stream);
         inplace_invert(&mut d_compressed_table_expression, &stream);
-                
+
         inplace_mul(&mut d_m_values, &d_compressed_table_expression, &stream);
         inplace_sub(&mut d_inputs_log_derivatives, &d_m_values, &stream);
 
-        let log_derivatives_diff: Vec<C::Scalar> = c_scalars_from_device_vec(&mut d_inputs_log_derivatives, &stream);
+        let log_derivatives_diff: Vec<C::Scalar> =
+            c_scalars_from_device_vec(&mut d_inputs_log_derivatives, &stream);
 
         stream.synchronize().unwrap();
         stream.destroy().unwrap();
 
-        log::trace!(" - log_derivatives_diff {:?}", start.elapsed());
+        log::info!(
+            "mv_lookup::commit_grand_sum: log-derivatives computed in {:.3?}",
+            start.elapsed()
+        );
 
         let start = instant::Instant::now();
         // Compute the evaluations of the lookup grand sum polynomial
@@ -313,7 +347,10 @@ impl<C: CurveAffine> Prepared<C> {
         assert_eq!(phi.len(), params.n() as usize);
         let phi = vk.domain.lagrange_from_vec(phi);
 
-        log::trace!(" - phi {:?}", start.elapsed());
+        log::info!(
+            "mv_lookup::commit_grand_sum: phi constructed in {:.3?}",
+            start.elapsed()
+        );
 
         #[cfg(feature = "sanity-checks")]
         // This test works only with intermediate representations in this method.
@@ -379,7 +416,10 @@ impl<C: CurveAffine> Prepared<C> {
         let phi_commitment = params
             .commit_lagrange_with_stream(&phi, grand_sum_blind, &stream)
             .to_affine();
-        log::trace!(" - phi_commitment {:?}", start.elapsed());
+        log::info!(
+            "mv_lookup::commit_grand_sum: phi commitment in {:.3?}",
+            start.elapsed()
+        );
 
         // Hash grand sum commitment
         // transcript.write_point(phi_commitment)?;
@@ -389,6 +429,10 @@ impl<C: CurveAffine> Prepared<C> {
 
         stream.synchronize().unwrap();
         stream.destroy().unwrap();
+        log::info!(
+            "mv_lookup::commit_grand_sum: completed in {:.3?}",
+            total_start.elapsed()
+        );
 
         Ok(Committed {
             m_poly,
