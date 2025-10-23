@@ -12,7 +12,9 @@ use crate::{
     },
 };
 
-use maybe_rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use maybe_rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+};
 
 #[cfg(feature = "thread-safe-region")]
 use std::collections::BTreeSet;

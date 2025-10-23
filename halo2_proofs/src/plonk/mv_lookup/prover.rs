@@ -17,21 +17,43 @@ use crate::{
     },
     transcript::{EncodedChallenge, TranscriptWrite},
 };
-use ff::WithSmallOrderMulGroup;
+use ff::{PrimeField, WithSmallOrderMulGroup};
 use group::{ff::Field, Curve};
 use icicle_runtime::{
     memory::{DeviceVec, HostSlice},
     stream::IcicleStream,
 };
 
+use icicle_bn254::curve::ScalarField;
+use rustc_hash::FxHashMap as HashMap;
+
 use maybe_rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
-    ParallelSliceMut,
 };
 use std::{
+    borrow::Borrow,
     iter,
     ops::{Mul, MulAssign},
+    slice,
 };
+
+#[derive(Clone, Eq, PartialEq, Hash)]
+struct ScalarKey(Box<[u8]>);
+
+impl ScalarKey {
+    fn from_scalar<F>(value: &F) -> Self
+    where
+        F: PrimeField,
+    {
+        ScalarKey(value.to_repr().as_ref().into())
+    }
+}
+
+impl Borrow<[u8]> for ScalarKey {
+    fn borrow(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 #[derive(Debug)]
 pub(in crate::plonk) struct Prepared<C: CurveAffine> {
@@ -151,13 +173,12 @@ impl<F: WithSmallOrderMulGroup<3>> Argument<F> {
         // compute m(X)
         let start = instant::Instant::now();
         log::info!("mv_lookup::prepare: building table index mapping");
-        let mut table_index_value_mapping: Vec<(Vec<u8>, usize)> = compressed_table_expression
+        let table_index_value_mapping: HashMap<ScalarKey, usize> = compressed_table_expression
             .par_iter()
             .take(chunk_size)
             .enumerate()
-            .map(|(i, &x)| (x.to_repr().as_ref().to_owned(), i))
+            .map(|(i, &x)| (ScalarKey::from_scalar(&x), i))
             .collect();
-        table_index_value_mapping.par_sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         log::info!(
             "mv_lookup::prepare: table index mapping built in {:.3?}",
             start.elapsed()
@@ -165,33 +186,36 @@ impl<F: WithSmallOrderMulGroup<3>> Argument<F> {
 
         let start = instant::Instant::now();
         log::info!("mv_lookup::prepare: accumulating m(X)");
-        let m_values: Vec<F> = {
-            let mut counts = vec![0u64; params.n() as usize];
-            compressed_inputs_expressions
-                .iter()
-                .for_each(|compressed_input_expression| {
-                    compressed_input_expression
-                        .iter()
-                        .take(chunk_size)
-                        .for_each(|fi| {
-                            let repr = fi.to_repr();
-                            let key = repr.as_ref();
-                            match table_index_value_mapping
-                                .binary_search_by(|(candidate, _)| candidate.as_slice().cmp(key))
-                            {
-                                Ok(pos) => {
-                                    let index = table_index_value_mapping[pos].1;
-                                    counts[index] += 1;
-                                }
-                                Err(_) => {
-                                    log::error!("value is OOR of lookup");
-                                }
-                            }
-                        });
-                });
+        let mut multiplicities: Vec<u64> = compressed_inputs_expressions
+            .par_iter()
+            .map(|compressed_input_expression| {
+                let mut local_counts = vec![0u64; chunk_size];
+                compressed_input_expression
+                    .iter()
+                    .take(chunk_size)
+                    .for_each(|fi| {
+                        let repr = fi.to_repr();
+                        if let Some(&index) = table_index_value_mapping.get(repr.as_ref()) {
+                            local_counts[index] += 1;
+                        } else {
+                            log::error!("value is OOR of lookup");
+                        }
+                    });
+                local_counts
+            })
+            .reduce(
+                || vec![0u64; chunk_size],
+                |mut acc, local_counts| {
+                    acc.iter_mut()
+                        .zip(local_counts.into_iter())
+                        .for_each(|(acc, count)| *acc += count);
+                    acc
+                },
+            );
 
-            counts.into_par_iter().map(F::from).collect()
-        };
+        multiplicities.resize(params.n() as usize, 0);
+
+        let m_values: Vec<F> = multiplicities.into_par_iter().map(F::from).collect();
         log::info!(
             "mv_lookup::prepare: m(X) accumulation completed in {:.3?}",
             start.elapsed()
@@ -292,13 +316,14 @@ impl<C: CurveAffine> Prepared<C> {
             device_vec_from_c_scalars(&self.compressed_table_expression, &stream);
 
         for compressed_input_expression in self.compressed_inputs_expressions.iter() {
-            let icicle_compressed_input_expression =
-                icicle_scalars_from_c_scalars(compressed_input_expression);
-            let h_icicle_compressed_input_expression =
-                HostSlice::from_slice(&icicle_compressed_input_expression);
-            d_temp
-                .copy_from_host_async(h_icicle_compressed_input_expression, &stream)
-                .unwrap();
+            let values: &[C::Scalar] = compressed_input_expression.as_ref();
+            // SAFETY: halo2's scalar representation matches Icicle's `ScalarField` layout (bn254 Fr),
+            // so we can reinterpret the slice without copying the limbs.
+            let icicle_values: &[ScalarField] = unsafe {
+                slice::from_raw_parts(values.as_ptr() as *const ScalarField, values.len())
+            };
+            let host_slice = HostSlice::from_slice(icicle_values);
+            d_temp.copy_from_host_async(host_slice, &stream).unwrap();
 
             inplace_scalar_add(&mut d_temp, &icicle_beta, &stream);
             inplace_invert(&mut d_temp, &stream);

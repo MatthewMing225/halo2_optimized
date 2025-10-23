@@ -7,8 +7,9 @@ use crate::helpers::SerdePrimeField;
 use crate::plonk::Assigned;
 use crate::SerdeFormat;
 use group::ff::{BatchInvert, Field};
+use maybe_rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 #[cfg(feature = "parallel-poly-read")]
-use maybe_rayon::{iter::ParallelIterator, prelude::ParallelSlice};
+use maybe_rayon::prelude::ParallelSlice;
 use rand_core::RngCore;
 
 use std::fmt::Debug;
@@ -241,7 +242,7 @@ pub(crate) fn batch_invert_assigned<F: Field>(
     assigned: Vec<Polynomial<Assigned<F>, LagrangeCoeff>>,
 ) -> Vec<Polynomial<F, LagrangeCoeff>> {
     let mut assigned_denominators: Vec<_> = assigned
-        .iter()
+        .par_iter()
         .map(|f| {
             f.iter()
                 .map(|value| value.denominator())
@@ -324,6 +325,70 @@ impl<F: Field> Polynomial<F, LagrangeCoeff> {
         Polynomial {
             values,
             _marker: PhantomData,
+        }
+    }
+}
+
+impl<F: Field, B: Basis> Polynomial<F, B> {
+    /// Adds `poly * k` into `self`.
+    pub fn add_mul_scalar(&mut self, poly: &Self, k: F) {
+        parallelize(&mut self.values, |chunk, start| {
+            for (lhs, rhs) in chunk.iter_mut().zip(poly.values[start..].iter()) {
+                *lhs += *rhs * k;
+            }
+        });
+    }
+
+    /// Adds a linear combination of polynomials into `self`.
+    pub fn add_mul_scalars(&mut self, polys: &[&Self], scalars: &[F]) {
+        assert_eq!(polys.len(), scalars.len());
+
+        parallelize(&mut self.values, |chunk, start| {
+            let mut idx = start;
+            for value in chunk.iter_mut() {
+                for (poly, scalar) in polys.iter().zip(scalars.iter()) {
+                    *value += poly.values[idx] * *scalar;
+                }
+                idx += 1;
+            }
+        });
+    }
+
+    /// Adds another polynomial into `self`.
+    pub fn add_inplace(&mut self, poly: &Self) {
+        parallelize(&mut self.values, |chunk, start| {
+            for (lhs, rhs) in chunk.iter_mut().zip(poly.values[start..].iter()) {
+                *lhs += *rhs;
+            }
+        });
+    }
+
+    /// Multiplies `self` by scalar `k` in place.
+    pub fn mul_inplace_scalar(&mut self, k: F) {
+        parallelize(&mut self.values, |chunk, _| {
+            for value in chunk.iter_mut() {
+                *value *= k;
+            }
+        });
+    }
+
+    /// Subtracts `poly * k` from the low-degree portion of `self`.
+    pub fn sub_low_poly_mul_scalar(&mut self, poly: &Self, k: F) {
+        let len = poly.len();
+        if len == 0 {
+            return;
+        }
+
+        if len > 1024 {
+            parallelize(&mut self.values[..len], |chunk, start| {
+                for (lhs, rhs) in chunk.iter_mut().zip(poly.values[start..].iter()) {
+                    *lhs -= *rhs * k;
+                }
+            });
+        } else {
+            for (lhs, rhs) in self.values[..len].iter_mut().zip(poly.values.iter()) {
+                *lhs -= *rhs * k;
+            }
         }
     }
 }

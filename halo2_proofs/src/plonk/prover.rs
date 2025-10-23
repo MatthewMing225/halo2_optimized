@@ -17,16 +17,17 @@ use super::{
     permutation, shuffle, vanishing, ChallengeBeta, ChallengeGamma, ChallengeTheta, ChallengeX,
     ChallengeY, Error, ProvingKey,
 };
+#[cfg(all(feature = "parallel-synthesis", not(feature = "mv-lookup")))]
+use maybe_rayon::iter::IntoParallelIterator;
+#[cfg(any(feature = "mv-lookup", feature = "parallel-synthesis"))]
+use maybe_rayon::iter::ParallelIterator;
 #[cfg(feature = "mv-lookup")]
-use maybe_rayon::iter::{IndexedParallelIterator, ParallelIterator};
+use maybe_rayon::iter::{IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator};
 
 #[cfg(not(feature = "mv-lookup"))]
 use super::lookup;
 #[cfg(feature = "mv-lookup")]
 use super::mv_lookup as lookup;
-
-#[cfg(feature = "mv-lookup")]
-use maybe_rayon::iter::{IntoParallelIterator, IntoParallelRefIterator};
 
 use crate::{
     arithmetic::{eval_polynomial, CurveAffine},
@@ -44,6 +45,40 @@ use crate::{
 };
 use group::prime::PrimeCurveAffine;
 
+#[cfg(feature = "parallel-synthesis")]
+/// Helper trait alias capturing the additional bounds required when
+/// parallel witness synthesis is enabled.
+pub trait ProverCircuit<F>: Circuit<F> + Sync
+where
+    F: Field,
+    Self::Config: Send + Sync,
+{
+}
+
+#[cfg(feature = "parallel-synthesis")]
+impl<F, C> ProverCircuit<F> for C
+where
+    F: Field,
+    C: Circuit<F> + Sync,
+    C::Config: Send + Sync,
+{
+}
+
+#[cfg(not(feature = "parallel-synthesis"))]
+pub trait ProverCircuit<F>: Circuit<F>
+where
+    F: Field,
+{
+}
+
+#[cfg(not(feature = "parallel-synthesis"))]
+impl<F, C> ProverCircuit<F> for C
+where
+    F: Field,
+    C: Circuit<F>,
+{
+}
+
 /// This creates a proof for the provided `circuit` when given the public
 /// parameters `params` and the proving key [`ProvingKey`] that was
 /// generated previously for the same circuit. The provided `instances`
@@ -55,7 +90,7 @@ pub fn create_proof<
     E: EncodedChallenge<Scheme::Curve>,
     R: RngCore + Send + Sync,
     T: TranscriptWrite<Scheme::Curve, E>,
-    ConcreteCircuit: Circuit<Scheme::Scalar>,
+    ConcreteCircuit: ProverCircuit<Scheme::Scalar>,
 >(
     params: &'params Scheme::ParamsProver,
     pk: &ProvingKey<Scheme::Curve>,
@@ -67,6 +102,7 @@ pub fn create_proof<
 where
     Scheme::Scalar: WithSmallOrderMulGroup<3> + FromUniformBytes<64>,
     Scheme::ParamsProver: Send + Sync,
+    ConcreteCircuit::Config: Send + Sync,
 {
     #[cfg(feature = "counter")]
     {
@@ -170,11 +206,17 @@ where
         pub advice_blinds: Vec<Blind<C::Scalar>>,
     }
 
+    #[cfg(feature = "parallel-synthesis")]
+    struct PhaseAssignment<F: Field> {
+        circuit_index: usize,
+        columns: Vec<usize>,
+        advice_values: Vec<Polynomial<F, LagrangeCoeff>>,
+    }
+
     struct WitnessCollection<'a, F: Field> {
         k: u32,
         current_phase: sealed::Phase,
         advice: Vec<Polynomial<Assigned<F>, LagrangeCoeff>>,
-        unblinded_advice: HashSet<usize>,
         challenges: &'a HashMap<usize, F>,
         instances: &'a [&'a [F]],
         usable_rows: RangeTo<usize>,
@@ -353,110 +395,216 @@ where
         for (current_phase, column_indices) in phase_column_indices.iter() {
             let phase_start = Instant::now();
             log::info!("advice phase {:?} started", current_phase);
+            let phase_value = *current_phase;
             let column_indices_set: HashSet<usize> = column_indices.iter().copied().collect();
-            for ((circuit, advice), instances) in
-                circuits.iter().zip(advice.iter_mut()).zip(instances)
-            {
-                let synth_start = Instant::now();
-                let mut witness = WitnessCollection {
-                    k: params.k(),
-                    current_phase: *current_phase,
-                    advice: vec![domain.empty_lagrange_assigned(); meta.num_advice_columns],
-                    unblinded_advice: HashSet::from_iter(meta.unblinded_advice_columns.clone()),
-                    instances,
-                    challenges: &challenges,
-                    // The prover will not be allowed to assign values to advice
-                    // cells that exist within inactive rows, which include some
-                    // number of blinding factors and an extra row for use in the
-                    // permutation argument.
-                    usable_rows: ..unusable_rows_start,
-                    _marker: std::marker::PhantomData,
-                };
+            let unblinded_advice_columns: HashSet<usize> =
+                HashSet::from_iter(meta.unblinded_advice_columns.clone());
 
-                // Synthesize the circuit to obtain the witness and other information.
-                ConcreteCircuit::FloorPlanner::synthesize(
-                    &mut witness,
-                    circuit,
-                    config.clone(),
-                    meta.constants.clone(),
-                )?;
-                log::info!(
-                    "witness generation for phase {:?} took {:.3?}",
-                    current_phase,
-                    synth_start.elapsed()
-                );
+            let mut handle_assignment = |circuit_index: usize,
+                                         advice_values: Vec<
+                Polynomial<Scheme::Scalar, LagrangeCoeff>,
+            >,
+                                         columns: Vec<usize>|
+             -> Result<(), Error> {
+                if columns.is_empty() {
+                    return Ok(());
+                }
 
-                let mut advice_values = batch_invert_assigned::<Scheme::Scalar>(
-                    witness
-                        .advice
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(column_index, advice)| {
-                            if column_indices_set.contains(&column_index) {
-                                Some(advice)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect(),
-                );
+                let commit_start = Instant::now();
+                let advice_entry = &mut advice[circuit_index];
+                let mut commitments_projective = Vec::with_capacity(columns.len());
+                let mut updates = Vec::with_capacity(columns.len());
 
-                // Add blinding factors to advice columns
-                for (column_index, advice_values) in column_indices.iter().zip(&mut advice_values) {
-                    if !witness.unblinded_advice.contains(column_index) {
-                        for cell in &mut advice_values[unusable_rows_start..] {
+                for (column_index, mut values) in columns.into_iter().zip(advice_values.into_iter())
+                {
+                    if !unblinded_advice_columns.contains(&column_index) {
+                        for cell in &mut values[unusable_rows_start..] {
                             *cell = Scheme::Scalar::random(&mut rng);
                         }
                     } else {
-                        for cell in &mut advice_values[unusable_rows_start..] {
+                        for cell in &mut values[unusable_rows_start..] {
                             *cell = Blind::default().0;
                         }
                     }
+
+                    let blind = if !unblinded_advice_columns.contains(&column_index) {
+                        Blind(Scheme::Scalar::random(&mut rng))
+                    } else {
+                        Blind::default()
+                    };
+
+                    commitments_projective.push(params.commit_lagrange(&values, blind));
+                    updates.push((column_index, values, blind));
                 }
 
-                // Compute commitments to advice column polynomials
-                let blinds: Vec<_> = column_indices
-                    .iter()
-                    .map(|i| {
-                        if witness.unblinded_advice.contains(i) {
-                            Blind::default()
-                        } else {
-                            Blind(Scheme::Scalar::random(&mut rng))
-                        }
-                    })
-                    .collect();
+                if commitments_projective.is_empty() {
+                    return Ok(());
+                }
 
-                let advice_commitments_projective: Vec<_> = advice_values
-                    .iter()
-                    .zip(blinds.iter())
-                    .map(|(poly, blind)| params.commit_lagrange(poly, *blind))
-                    .collect();
-                let mut advice_commitments =
-                    vec![Scheme::Curve::identity(); advice_commitments_projective.len()];
+                let mut commitments = vec![Scheme::Curve::identity(); commitments_projective.len()];
                 <Scheme::Curve as CurveAffine>::CurveExt::batch_normalize(
-                    &advice_commitments_projective,
-                    &mut advice_commitments,
+                    &commitments_projective,
+                    &mut commitments,
                 );
-                let advice_commitments = advice_commitments;
-                drop(advice_commitments_projective);
 
-                for commitment in &advice_commitments {
+                for commitment in &commitments {
                     transcript.write_point(*commitment)?;
                 }
-                for ((column_index, advice_values), blind) in
-                    column_indices.iter().zip(advice_values).zip(blinds)
-                {
-                    advice.advice_polys[*column_index] = advice_values;
-                    advice.advice_blinds[*column_index] = blind;
+
+                for (column_index, values, blind) in updates {
+                    advice_entry.advice_polys[column_index] = values;
+                    advice_entry.advice_blinds[column_index] = blind;
+                }
+
+                log::info!(
+                    "advice commitment work for circuit {} phase {:?} took {:.3?}",
+                    circuit_index,
+                    phase_value,
+                    commit_start.elapsed()
+                );
+
+                Ok(())
+            };
+
+            #[cfg(feature = "parallel-synthesis")]
+            {
+                let current_phase_val = phase_value;
+                let phase_collection_start = Instant::now();
+                let mut phase_assignments = (0..circuits.len())
+                    .into_par_iter()
+                    .map(
+                        |circuit_index| -> Result<PhaseAssignment<Scheme::Scalar>, Error> {
+                            let synth_start = Instant::now();
+                            let mut witness = WitnessCollection {
+                                k: params.k(),
+                                current_phase: current_phase_val,
+                                advice: vec![
+                                    domain.empty_lagrange_assigned();
+                                    meta.num_advice_columns
+                                ],
+                                instances: instances[circuit_index],
+                                challenges: &challenges,
+                                usable_rows: ..unusable_rows_start,
+                                _marker: std::marker::PhantomData,
+                            };
+
+                            ConcreteCircuit::FloorPlanner::synthesize(
+                                &mut witness,
+                                &circuits[circuit_index],
+                                config.clone(),
+                                meta.constants.clone(),
+                            )?;
+                            log::info!("this is a test");
+
+                            log::info!(
+                                "witness generation for phase {:?} circuit {} took {:.3?}",
+                                current_phase_val,
+                                circuit_index,
+                                synth_start.elapsed()
+                            );
+
+                            let mut columns = Vec::with_capacity(column_indices.len());
+                            let mut assigned = Vec::with_capacity(column_indices.len());
+                            for (column_index, advice_poly) in
+                                witness.advice.into_iter().enumerate()
+                            {
+                                if column_indices_set.contains(&column_index) {
+                                    columns.push(column_index);
+                                    assigned.push(advice_poly);
+                                }
+                            }
+
+                            let invert_start = Instant::now();
+                            let advice_values = batch_invert_assigned::<Scheme::Scalar>(assigned);
+                            log::info!(
+                                "phase {:?} circuit {}: batch inversion took {:.3?}",
+                                current_phase_val,
+                                circuit_index,
+                                invert_start.elapsed()
+                            );
+
+                            Ok(PhaseAssignment {
+                                circuit_index,
+                                columns,
+                                advice_values,
+                            })
+                        },
+                    )
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                phase_assignments.sort_by_key(|assignment| assignment.circuit_index);
+
+                for assignment in phase_assignments {
+                    handle_assignment(
+                        assignment.circuit_index,
+                        assignment.advice_values,
+                        assignment.columns,
+                    )?;
                 }
                 log::info!(
-                    "advice commitment work for circuit/phase {:?} took {:.3?}",
-                    current_phase,
-                    synth_start.elapsed()
+                    "phase {:?}: parallel witness collection completed in {:.3?}",
+                    phase_value,
+                    phase_collection_start.elapsed()
                 );
             }
+
+            #[cfg(not(feature = "parallel-synthesis"))]
+            {
+                let serial_collection_start = Instant::now();
+                for (circuit_index, circuit) in circuits.iter().enumerate() {
+                    let synth_start = Instant::now();
+                    let mut witness = WitnessCollection {
+                        k: params.k(),
+                        current_phase: phase_value,
+                        advice: vec![domain.empty_lagrange_assigned(); meta.num_advice_columns],
+                        instances: instances[circuit_index],
+                        challenges: &challenges,
+                        usable_rows: ..unusable_rows_start,
+                        _marker: std::marker::PhantomData,
+                    };
+
+                    ConcreteCircuit::FloorPlanner::synthesize(
+                        &mut witness,
+                        circuit,
+                        config.clone(),
+                        meta.constants.clone(),
+                    )?;
+                    log::info!(
+                        "witness generation for phase {:?} circuit {} took {:.3?}",
+                        phase_value,
+                        circuit_index,
+                        synth_start.elapsed()
+                    );
+
+                    let mut columns = Vec::with_capacity(column_indices.len());
+                    let mut assigned = Vec::with_capacity(column_indices.len());
+                    for (column_index, advice_poly) in witness.advice.into_iter().enumerate() {
+                        if column_indices_set.contains(&column_index) {
+                            columns.push(column_index);
+                            assigned.push(advice_poly);
+                        }
+                    }
+
+                    let invert_start = Instant::now();
+                    let advice_values = batch_invert_assigned::<Scheme::Scalar>(assigned);
+                    log::info!(
+                        "phase {:?} circuit {}: batch inversion took {:.3?}",
+                        phase_value,
+                        circuit_index,
+                        invert_start.elapsed()
+                    );
+
+                    handle_assignment(circuit_index, advice_values, columns)?;
+                }
+                log::info!(
+                    "phase {:?}: serial witness collection completed in {:.3?}",
+                    phase_value,
+                    serial_collection_start.elapsed()
+                );
+            }
+
             for (index, phase) in meta.challenge_phase.iter().enumerate() {
-                if *current_phase == *phase {
+                if phase_value == *phase {
                     let challenge_start = Instant::now();
                     let existing =
                         challenges.insert(index, *transcript.squeeze_challenge_scalar::<()>());
@@ -577,15 +725,33 @@ where
     // preallocate the lookups
 
     #[cfg(feature = "mv-lookup")]
+    let commit_stage_start = Instant::now();
+    #[cfg(feature = "mv-lookup")]
+    let phi_blind_start = Instant::now();
+    #[cfg(feature = "mv-lookup")]
     let phi_blinds = (0..pk.vk.cs.blinding_factors())
         .map(|_| Scheme::Scalar::random(&mut rng))
         .collect::<Vec<_>>();
+    #[cfg(feature = "mv-lookup")]
+    log::info!(
+        "mv_lookup::commit_grand_sum: sampled {} phi blinds in {:.3?}",
+        phi_blinds.len(),
+        phi_blind_start.elapsed()
+    );
 
+    #[cfg(feature = "mv-lookup")]
+    let prepared_lookup_batches = lookups.len();
     #[cfg(feature = "mv-lookup")]
     let commit_lookups = || -> Result<Vec<Vec<lookup::prover::Committed<Scheme::Curve>>>, _> {
         lookups
             .into_par_iter()
-            .map(|lookups| -> Result<Vec<_>, _> {
+            .enumerate()
+            .map(|(batch_idx, lookups)| -> Result<Vec<_>, _> {
+                log::info!(
+                    "mv_lookup::commit_grand_sum: launching batch {} with {} lookups",
+                    batch_idx,
+                    lookups.len()
+                );
                 // Construct and commit to products for each lookup
                 lookups
                     .into_par_iter()
@@ -610,8 +776,13 @@ where
             })
             .collect::<Result<Vec<_>, _>>()
     };
-
     let lookups = commit_lookups()?;
+    #[cfg(feature = "mv-lookup")]
+    log::info!(
+        "mv_lookup::commit_grand_sum: completed {} batches in {:.3?}",
+        prepared_lookup_batches,
+        commit_stage_start.elapsed()
+    );
 
     #[cfg(feature = "mv-lookup")]
     {

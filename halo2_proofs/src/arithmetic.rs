@@ -15,6 +15,8 @@ use icicle_runtime::memory::DeviceSlice;
 
 use halo2curves::msm::msm_best;
 pub use halo2curves::{CurveAffine, CurveExt};
+use maybe_rayon::iter::{IndexedParallelIterator, ParallelIterator};
+use maybe_rayon::prelude::ParallelSliceMut;
 
 /// This represents an element of a group with basic operations that can be
 /// performed. This allows an FFT implementation (for example) to operate
@@ -141,6 +143,188 @@ pub fn compute_inner_product<F: Field>(a: &[F], b: &[F]) -> F {
     }
 
     acc
+}
+
+/// Multiplies each element of `values` by scalar `k` in parallel.
+pub fn vector_mul_scalar_inplace<F: Field>(values: &mut [F], k: F) {
+    parallelize(values, |chunk, _| {
+        for value in chunk.iter_mut() {
+            *value *= k;
+        }
+    });
+}
+
+/// Computes the first `n` powers of `base` in parallel.
+pub fn compute_powers<F: Field>(base: F, n: usize) -> Vec<F> {
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let num_threads = multicore::current_num_threads().max(1);
+    let chunk_size = (n + num_threads - 1) / num_threads;
+    let mut powers = vec![F::ZERO; n];
+
+    powers
+        .par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let start = chunk_idx * chunk_size;
+            let mut value = base.pow_vartime([start as u64, 0, 0, 0]);
+            for slot in chunk.iter_mut() {
+                *slot = value;
+                value *= base;
+            }
+        });
+
+    powers
+}
+
+/// Divides polynomial `poly` by `X - b` with no remainder using parallelism.
+pub fn kate_division_par<F: Field>(poly: &[F], b: F) -> Vec<F> {
+    fn poly_div<F: Field>(coeffs: &[F], b: F, quotient: &mut [F], remainder: &mut F) {
+        if coeffs.is_empty() {
+            *remainder = F::ZERO;
+            return;
+        }
+
+        let neg_b = -b;
+        let mut tmp = F::ZERO;
+        for i in (0..coeffs.len() - 1).rev() {
+            let mut lead_coeff = coeffs[i + 1];
+            lead_coeff -= tmp;
+            quotient[i] = lead_coeff;
+            tmp = lead_coeff;
+            tmp *= neg_b;
+        }
+
+        *remainder = coeffs[0] - tmp;
+    }
+
+    let n = poly.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![F::ZERO];
+    }
+
+    let num_threads = multicore::current_num_threads().max(1);
+    let mut quotient = vec![F::ZERO; n];
+    let mut remainders = vec![F::ZERO; num_threads];
+
+    if n < num_threads || num_threads == 1 {
+        poly_div(poly, b, &mut quotient[..n], &mut remainders[0]);
+    } else {
+        let chunk_size = (n + num_threads - 1) / num_threads;
+
+        multicore::scope(|scope| {
+            for (chunk_idx, (remainder_slot, q_chunk)) in remainders
+                .chunks_mut(1)
+                .zip(quotient.chunks_mut(chunk_size))
+                .enumerate()
+            {
+                scope.spawn(move |_| {
+                    let start = chunk_idx * chunk_size;
+                    let end = core::cmp::min(start + chunk_size, n);
+                    poly_div(&poly[start..end], b, q_chunk, &mut remainder_slot[0]);
+                });
+            }
+        });
+
+        let mut powers = compute_powers(b, chunk_size);
+        if !powers.is_empty() {
+            powers.reverse();
+
+            for tid in (0..num_threads - 1).rev() {
+                let carry = remainders[tid + 1];
+                remainders[tid] += carry * powers[0] * b;
+            }
+
+            quotient
+                .par_chunks_mut(chunk_size)
+                .enumerate()
+                .take(num_threads - 1)
+                .for_each(|(tid, chunk)| {
+                    let carry = remainders[tid + 1];
+                    for (i, coeff) in chunk.iter_mut().enumerate() {
+                        let pow = powers[i];
+                        *coeff += pow * carry;
+                    }
+                });
+
+            for tid in 1..num_threads {
+                let idx = tid * chunk_size - 1;
+                if idx < quotient.len() {
+                    quotient[idx] = remainders[tid];
+                }
+            }
+        }
+    }
+
+    quotient[..n - 1].to_vec()
+}
+
+/// Divides polynomial `poly` by `(X - b_0)(X - b_1)` without remainder.
+pub fn kate_division_deg2<'a, F: Field, I: IntoIterator<Item = &'a F>>(
+    poly: I,
+    roots: &[F],
+) -> Vec<F>
+where
+    I::IntoIter: DoubleEndedIterator + ExactSizeIterator,
+{
+    let (b1, b2) = (roots[0], roots[1]);
+    let poly = poly.into_iter();
+
+    let mut quotient = vec![F::ZERO; poly.len() - roots.len()];
+    let mut prev1 = F::ZERO;
+    let mut prev2 = F::ZERO;
+
+    for (q, coeff) in quotient.iter_mut().rev().zip(poly.rev()) {
+        let mut lead = *coeff;
+        lead += prev2 * b2;
+        prev2 = lead;
+
+        lead += prev1;
+        *q = lead;
+        prev1 = lead * b1;
+    }
+
+    quotient
+}
+
+/// Divides polynomial `poly` by `(X - b_0)(X - b_1)(X - b_2)` without remainder.
+pub fn kate_division_deg3<'a, F: Field, I: IntoIterator<Item = &'a F>>(
+    poly: I,
+    roots: &[F],
+) -> Vec<F>
+where
+    I::IntoIter: DoubleEndedIterator + ExactSizeIterator,
+{
+    let (b1, b2, b3) = (roots[0], roots[1], roots[2]);
+    let poly = poly.into_iter();
+
+    let mut quotient = vec![F::ZERO; poly.len() - roots.len()];
+    let mut prev1 = F::ZERO;
+    let mut prev2 = F::ZERO;
+    let mut prev3 = F::ZERO;
+    let mut prev_q = F::ZERO;
+
+    for (q, coeff) in quotient.iter_mut().rev().zip(poly.rev()) {
+        let mut lead = *coeff;
+
+        lead += prev3 * b3;
+        prev3 = lead;
+
+        lead += prev1;
+        lead += (prev_q - prev2) * b2;
+        *q = lead;
+
+        prev2 = prev1;
+        prev1 = lead * b1;
+        prev_q = lead;
+    }
+
+    quotient
 }
 
 /// Divides polynomial `a` in `X` by `X - b` with
@@ -311,6 +495,19 @@ pub(crate) fn evaluate_vanishing_polynomial<F: Field>(roots: &[F], z: F) -> F {
 
 pub(crate) fn powers<F: Field>(base: F) -> impl Iterator<Item = F> {
     std::iter::successors(Some(F::ONE), move |power| Some(base * power))
+}
+
+pub(crate) fn powers_of_x<F: Field>(base: F, n: usize) -> Vec<F> {
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let mut result = Vec::with_capacity(n);
+    result.push(F::ONE);
+    for i in 1..n {
+        result.push(result[i - 1] * base);
+    }
+    result
 }
 
 /// Reverse `l` LSBs of bitvector `n`
