@@ -269,7 +269,7 @@ where
         cs.constants.clone(),
     )?;
 
-    let mut fixed = batch_invert_assigned(assembly.fixed);
+    let mut fixed = batch_invert_assigned(assembly.fixed.iter());
     let (cs, selector_polys) = if compress_selectors {
         cs.compress_selectors(assembly.selectors.clone(), true)
     } else {
@@ -342,7 +342,7 @@ where
         cs.constants.clone(),
     )?;
 
-    let mut fixed = batch_invert_assigned(assembly.fixed);
+    let mut fixed = batch_invert_assigned(assembly.fixed.iter());
     let (cs, selector_polys) = if vk.compress_selectors {
         cs.compress_selectors(assembly.selectors, true)
     } else {
