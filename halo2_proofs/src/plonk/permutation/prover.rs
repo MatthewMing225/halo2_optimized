@@ -1,8 +1,14 @@
 use ff::PrimeField;
 use group::{ff::Field, Curve};
 use icicle_runtime::stream::IcicleStream;
+use maybe_rayon::prelude::{
+    IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut,
+};
 use rand_core::RngCore;
-use std::iter::{self, ExactSizeIterator};
+use std::{
+    iter::{self, ExactSizeIterator},
+    thread,
+};
 
 use super::super::{circuit::Any, ChallengeBeta, ChallengeGamma, ChallengeX};
 use super::{Argument, ProvingKey};
@@ -86,6 +92,7 @@ impl Argument {
             .chunks(chunk_len)
             .zip(pkey.permutations.chunks(chunk_len))
         {
+            let chunk_start = instant::Instant::now();
             // Goal is to compute the products of fractions
             //
             // (p_j(\omega^i) + \delta^j \omega^i \beta + \gamma) /
@@ -115,9 +122,15 @@ impl Argument {
             }
 
             // Invert to obtain the denominator for the permutation product polynomial
+            let invert_start = instant::Instant::now();
             modified_values = icicle_invert(&modified_values, &stream);
+            log::info!(
+                "permutation::commit chunk: denominator inversion took {:.3?}",
+                invert_start.elapsed()
+            );
             // Iterate over each column again, this time finishing the computation
             // of the entire fraction by computing the numerators
+            let numerator_start = instant::Instant::now();
             for &column in columns.iter() {
                 let omega = domain.get_omega();
                 let values = match column.column_type() {
@@ -138,6 +151,10 @@ impl Argument {
                 });
                 deltaomega *= &<C::Scalar as PrimeField>::DELTA;
             }
+            log::info!(
+                "permutation::commit chunk: numerator accumulation took {:.3?}",
+                numerator_start.elapsed()
+            );
 
             // The modified_values vector is a vector of products of fractions
             // of the form
@@ -150,13 +167,48 @@ impl Argument {
 
             // Compute the evaluations of the permutation product polynomial
             // over our domain, starting with z[0] = 1
-            let mut z = vec![last_z];
-            for row in 1..(params.n() as usize) {
-                let mut tmp = z[row - 1];
+            let size = params.n() as usize;
+            let mut z = vec![C::Scalar::ONE; size];
+            z[0] = last_z;
 
-                tmp *= &modified_values[row - 1];
-                z.push(tmp);
+            let prefix_start = instant::Instant::now();
+            let tail_len = size.saturating_sub(1);
+            if tail_len > 0 {
+                let threads = thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1);
+                let chunk_size = std::cmp::max(512, (tail_len + threads - 1) / threads);
+                let mut chunk_products = Vec::new();
+                {
+                    let tail_slice = &mut z[1..];
+                    let mods_slice = &modified_values[..tail_len];
+                    tail_slice
+                        .par_chunks_mut(chunk_size)
+                        .zip(mods_slice.par_chunks(chunk_size))
+                        .map(|(chunk_z, chunk_mod)| {
+                            let mut acc = C::Scalar::ONE;
+                            for (out, &m) in chunk_z.iter_mut().zip(chunk_mod.iter()) {
+                                acc *= m;
+                                *out = acc;
+                            }
+                            acc
+                        })
+                        .collect_into_vec(&mut chunk_products);
+
+                    let mut cumulative = last_z;
+                    for (chunk_idx, chunk_z) in tail_slice.chunks_mut(chunk_size).enumerate() {
+                        for val in chunk_z.iter_mut() {
+                            *val *= cumulative;
+                        }
+                        cumulative *= chunk_products[chunk_idx];
+                    }
+                }
             }
+            log::info!(
+                "permutation::commit chunk: prefix product took {:.3?}",
+                prefix_start.elapsed()
+            );
+            let lagrange_start = instant::Instant::now();
             let mut z = domain.lagrange_from_vec(z);
             // Set blinding factors
             for z in &mut z[params.n() as usize - blinding_factors..] {
@@ -165,6 +217,12 @@ impl Argument {
             // Set new last_z
             last_z = z[params.n() as usize - (blinding_factors + 1)];
 
+            log::info!(
+                "permutation::commit chunk: lagrange conversion + blinding took {:.3?}",
+                lagrange_start.elapsed()
+            );
+
+            let commit_start = instant::Instant::now();
             let blind = Blind(C::Scalar::random(&mut rng));
             let permutation_product_commitment_projective =
                 params.commit_lagrange_with_stream(&z, blind, &stream);
@@ -175,6 +233,10 @@ impl Argument {
 
             stream.synchronize().unwrap();
             stream.destroy().unwrap();
+            log::info!(
+                "permutation::commit chunk: commit + FFT conversions took {:.3?}",
+                commit_start.elapsed()
+            );
 
             let permutation_product_commitment =
                 permutation_product_commitment_projective.to_affine();
@@ -187,6 +249,10 @@ impl Argument {
                 permutation_product_coset,
                 permutation_product_blind,
             });
+            log::info!(
+                "permutation::commit chunk: total elapsed {:.3?}",
+                chunk_start.elapsed()
+            );
         }
 
         stream.synchronize().unwrap();

@@ -8,8 +8,8 @@ use crate::SerdeFormat;
 use crate::{
     arithmetic::{eval_polynomial, CurveAffine},
     icicle::{
-        c_scalars_from_device_vec, device_vec_from_c_scalars, icicle_scalars_from_c_scalars,
-        inplace_add, inplace_invert, inplace_mul, inplace_scalar_add, inplace_sub,
+        c_scalars_from_device_vec, device_vec_from_c_scalars, inplace_add, inplace_invert,
+        inplace_mul, inplace_scalar_add, inplace_sub,
     },
     poly::{
         commitment::{Blind, Params},
