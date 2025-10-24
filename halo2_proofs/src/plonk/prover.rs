@@ -7,6 +7,8 @@ use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
 use std::iter;
 use std::ops::RangeTo;
+#[cfg(feature = "parallel-synthesis")]
+use std::sync::{Arc, Mutex};
 
 use super::{
     circuit::{
@@ -65,6 +67,7 @@ where
 }
 
 #[cfg(not(feature = "parallel-synthesis"))]
+/// Helper trait alias when witness synthesis runs serially.
 pub trait ProverCircuit<F>: Circuit<F>
 where
     F: Field,
@@ -139,6 +142,17 @@ where
     // Selector optimizations cannot be applied here; use the ConstraintSystem
     // from the verification key.
     let meta = &pk.vk.cs;
+
+    #[cfg(feature = "parallel-synthesis")]
+    let advice_pools: Arc<Vec<Mutex<Vec<Polynomial<Assigned<Scheme::Scalar>, LagrangeCoeff>>>>> =
+        Arc::new(
+            (0..circuits.len())
+                .map(|_| Mutex::new(Vec::new()))
+                .collect(),
+        );
+    #[cfg(not(feature = "parallel-synthesis"))]
+    let mut advice_pools: Vec<Vec<Polynomial<Assigned<Scheme::Scalar>, LagrangeCoeff>>> =
+        vec![Vec::new(); circuits.len()];
 
     struct InstanceSingle<C: CurveAffine> {
         pub instance_values: Vec<Polynomial<C::Scalar, LagrangeCoeff>>,
@@ -396,7 +410,6 @@ where
             let phase_start = Instant::now();
             log::info!("advice phase {:?} started", current_phase);
             let phase_value = *current_phase;
-            let column_indices_set: HashSet<usize> = column_indices.iter().copied().collect();
             let unblinded_advice_columns: HashSet<usize> =
                 HashSet::from_iter(meta.unblinded_advice_columns.clone());
 
@@ -470,66 +483,76 @@ where
             {
                 let current_phase_val = phase_value;
                 let phase_collection_start = Instant::now();
+                let column_indices = column_indices.clone();
+                let advice_pools = Arc::clone(&advice_pools);
                 let mut phase_assignments = (0..circuits.len())
                     .into_par_iter()
-                    .map(
-                        |circuit_index| -> Result<PhaseAssignment<Scheme::Scalar>, Error> {
-                            let synth_start = Instant::now();
-                            let mut witness = WitnessCollection {
-                                k: params.k(),
-                                current_phase: current_phase_val,
-                                advice: vec![
-                                    domain.empty_lagrange_assigned();
-                                    meta.num_advice_columns
-                                ],
-                                instances: instances[circuit_index],
-                                challenges: &challenges,
-                                usable_rows: ..unusable_rows_start,
-                                _marker: std::marker::PhantomData,
-                            };
-
-                            ConcreteCircuit::FloorPlanner::synthesize(
-                                &mut witness,
-                                &circuits[circuit_index],
-                                config.clone(),
-                                meta.constants.clone(),
-                            )?;
-                            log::info!("this is a test");
-
-                            log::info!(
-                                "witness generation for phase {:?} circuit {} took {:.3?}",
-                                current_phase_val,
-                                circuit_index,
-                                synth_start.elapsed()
-                            );
-
-                            let mut columns = Vec::with_capacity(column_indices.len());
-                            let mut assigned = Vec::with_capacity(column_indices.len());
-                            for (column_index, advice_poly) in
-                                witness.advice.into_iter().enumerate()
-                            {
-                                if column_indices_set.contains(&column_index) {
-                                    columns.push(column_index);
-                                    assigned.push(advice_poly);
+                    .map(move |circuit_index| -> Result<PhaseAssignment<Scheme::Scalar>, Error> {
+                        let synth_start = Instant::now();
+                        let mut advice_storage = {
+                            let mut guard = advice_pools[circuit_index].lock().unwrap();
+                            if guard.is_empty() {
+                                guard.resize_with(meta.num_advice_columns, || {
+                                    domain.empty_lagrange_assigned()
+                                });
+                            }
+                            for poly in guard.iter_mut() {
+                                for value in poly.iter_mut() {
+                                    *value = Assigned::Zero;
                                 }
                             }
+                            let mut storage = Vec::new();
+                            std::mem::swap(&mut *guard, &mut storage);
+                            storage
+                        };
 
-                            let invert_start = Instant::now();
-                            let advice_values = batch_invert_assigned::<Scheme::Scalar>(assigned);
-                            log::info!(
-                                "phase {:?} circuit {}: batch inversion took {:.3?}",
-                                current_phase_val,
-                                circuit_index,
-                                invert_start.elapsed()
-                            );
+                        let mut witness = WitnessCollection {
+                            k: params.k(),
+                            current_phase: current_phase_val,
+                            advice: advice_storage,
+                            instances: instances[circuit_index],
+                            challenges: &challenges,
+                            usable_rows: ..unusable_rows_start,
+                            _marker: std::marker::PhantomData,
+                        };
 
-                            Ok(PhaseAssignment {
-                                circuit_index,
-                                columns,
-                                advice_values,
-                            })
-                        },
-                    )
+                        ConcreteCircuit::FloorPlanner::synthesize(
+                            &mut witness,
+                            &circuits[circuit_index],
+                            config.clone(),
+                            meta.constants.clone(),
+                        )?;
+                        log::info!(
+                            "witness generation for phase {:?} circuit {} took {:.3?}",
+                            current_phase_val,
+                            circuit_index,
+                            synth_start.elapsed()
+                        );
+
+                        let advice_storage = witness.advice;
+                        let columns = column_indices.clone();
+                        let invert_start = Instant::now();
+                        let advice_values = batch_invert_assigned(
+                            columns.iter().map(|&column_index| &advice_storage[column_index]),
+                        );
+                        log::info!(
+                            "phase {:?} circuit {}: batch inversion took {:.3?}",
+                            current_phase_val,
+                            circuit_index,
+                            invert_start.elapsed()
+                        );
+
+                        {
+                            let mut guard = advice_pools[circuit_index].lock().unwrap();
+                            *guard = advice_storage;
+                        }
+
+                        Ok(PhaseAssignment {
+                            circuit_index,
+                            columns,
+                            advice_values,
+                        })
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
 
                 phase_assignments.sort_by_key(|assignment| assignment.circuit_index);
@@ -553,10 +576,23 @@ where
                 let serial_collection_start = Instant::now();
                 for (circuit_index, circuit) in circuits.iter().enumerate() {
                     let synth_start = Instant::now();
+                    let advice_buffer = &mut advice_pools[circuit_index];
+                    if advice_buffer.is_empty() {
+                        advice_buffer
+                            .resize_with(meta.num_advice_columns, || domain.empty_lagrange_assigned());
+                    }
+                    for poly in advice_buffer.iter_mut() {
+                        for value in poly.iter_mut() {
+                            *value = Assigned::Zero;
+                        }
+                    }
+                    let mut advice_storage = Vec::new();
+                    std::mem::swap(advice_buffer, &mut advice_storage);
+
                     let mut witness = WitnessCollection {
                         k: params.k(),
                         current_phase: phase_value,
-                        advice: vec![domain.empty_lagrange_assigned(); meta.num_advice_columns],
+                        advice: advice_storage,
                         instances: instances[circuit_index],
                         challenges: &challenges,
                         usable_rows: ..unusable_rows_start,
@@ -576,23 +612,20 @@ where
                         synth_start.elapsed()
                     );
 
-                    let mut columns = Vec::with_capacity(column_indices.len());
-                    let mut assigned = Vec::with_capacity(column_indices.len());
-                    for (column_index, advice_poly) in witness.advice.into_iter().enumerate() {
-                        if column_indices_set.contains(&column_index) {
-                            columns.push(column_index);
-                            assigned.push(advice_poly);
-                        }
-                    }
-
+                    let advice_storage = witness.advice;
+                    let columns = column_indices.clone();
                     let invert_start = Instant::now();
-                    let advice_values = batch_invert_assigned::<Scheme::Scalar>(assigned);
+                    let advice_values = batch_invert_assigned(
+                        columns.iter().map(|&column_index| &advice_storage[column_index]),
+                    );
                     log::info!(
                         "phase {:?} circuit {}: batch inversion took {:.3?}",
                         phase_value,
                         circuit_index,
                         invert_start.elapsed()
                     );
+
+                    *advice_buffer = advice_storage;
 
                     handle_assignment(circuit_index, advice_values, columns)?;
                 }
