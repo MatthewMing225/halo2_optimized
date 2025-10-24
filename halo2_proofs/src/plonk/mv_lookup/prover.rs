@@ -35,20 +35,76 @@ use maybe_rayon::prelude::{
 use std::{
     borrow::Borrow,
     cell::RefCell,
+    hash::{Hash, Hasher},
     iter,
     ops::{Mul, MulAssign},
     slice,
 };
 
-#[derive(Clone, Eq, PartialEq, Hash)]
-struct ScalarKey(Box<[u8]>);
+struct ScalarKey<F>
+where
+    F: PrimeField,
+{
+    repr: F::Repr,
+}
 
-impl ScalarKey {
-    fn from_scalar<F>(value: &F) -> Self
-    where
-        F: PrimeField,
-    {
-        ScalarKey(value.to_repr().as_ref().into())
+impl<F> Clone for ScalarKey<F>
+where
+    F: PrimeField,
+    F::Repr: Clone,
+{
+    fn clone(&self) -> Self {
+        ScalarKey {
+            repr: self.repr.clone(),
+        }
+    }
+}
+
+impl<F> ScalarKey<F>
+where
+    F: PrimeField,
+{
+    fn from_scalar(value: &F) -> Self {
+        ScalarKey {
+            repr: value.to_repr(),
+        }
+    }
+}
+
+impl<F> PartialEq for ScalarKey<F>
+where
+    F: PrimeField,
+    F::Repr: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.repr == other.repr
+    }
+}
+
+impl<F> Eq for ScalarKey<F>
+where
+    F: PrimeField,
+    F::Repr: Eq,
+{
+}
+
+impl<F> Hash for ScalarKey<F>
+where
+    F: PrimeField,
+    F::Repr: AsRef<[u8]>,
+{
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write(self.repr.as_ref());
+    }
+}
+
+impl<F> Borrow<[u8]> for ScalarKey<F>
+where
+    F: PrimeField,
+    F::Repr: AsRef<[u8]>,
+{
+    fn borrow(&self) -> &[u8] {
+        self.repr.as_ref()
     }
 }
 
@@ -117,12 +173,6 @@ thread_local! {
     static GRAND_SUM_STREAM: RefCell<IcicleStream> = RefCell::new(IcicleStream::create().expect("failed to create mv-lookup stream"));
 }
 
-impl Borrow<[u8]> for ScalarKey {
-    fn borrow(&self) -> &[u8] {
-        &self.0
-    }
-}
-
 #[derive(Debug)]
 pub(in crate::plonk) struct Prepared<C: CurveAffine> {
     compressed_inputs_expressions: Vec<Polynomial<C::Scalar, LagrangeCoeff>>,
@@ -187,7 +237,9 @@ impl<F: WithSmallOrderMulGroup<3>> Argument<F> {
     ) -> Result<Prepared<C>, Error>
     where
         C: CurveAffine<ScalarExt = F>,
+        F: PrimeField,
         C::Curve: Mul<F, Output = C::Curve> + MulAssign<F>,
+        F::Repr: Clone + Eq + AsRef<[u8]> + Send + Sync,
     {
         let n = params.n() as usize;
         // Closure to get values of expressions and compress them
@@ -241,7 +293,8 @@ impl<F: WithSmallOrderMulGroup<3>> Argument<F> {
         // compute m(X)
         let start = instant::Instant::now();
         log::info!("mv_lookup::prepare: building table index mapping");
-        let table_index_value_mapping: HashMap<ScalarKey, usize> = compressed_table_expression
+        let table_index_value_mapping: HashMap<ScalarKey<C::Scalar>, usize> =
+            compressed_table_expression
             .par_iter()
             .take(chunk_size)
             .enumerate()

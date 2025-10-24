@@ -1,4 +1,4 @@
-use ff::{Field, FromUniformBytes, WithSmallOrderMulGroup};
+use ff::{Field, FromUniformBytes, PrimeField, WithSmallOrderMulGroup};
 use group::Curve;
 use instant::Instant;
 use rand_core::RngCore;
@@ -107,6 +107,7 @@ where
     Scheme::Scalar: WithSmallOrderMulGroup<3> + FromUniformBytes<64>,
     Scheme::ParamsProver: Send + Sync,
     ConcreteCircuit::Config: Send + Sync,
+    <Scheme::Scalar as PrimeField>::Repr: Eq + Clone + AsRef<[u8]> + Send + Sync,
 {
     #[cfg(feature = "counter")]
     {
