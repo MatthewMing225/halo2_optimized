@@ -49,3 +49,5 @@ pub use helpers::SerdePrimeField;
 
 #[allow(unsafe_code)]
 pub mod icicle;
+/// Utilities for debugging and instrumentation helpers.
+pub mod util;

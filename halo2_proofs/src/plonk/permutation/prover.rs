@@ -2,7 +2,11 @@ use ff::PrimeField;
 use group::{ff::Field, Curve};
 use icicle_runtime::stream::IcicleStream;
 use rand_core::RngCore;
-use std::iter::{self, ExactSizeIterator};
+use std::{
+    iter::{self, ExactSizeIterator},
+    sync::mpsc::{channel, sync_channel, TryRecvError},
+    thread,
+};
 
 use super::super::{circuit::Any, ChallengeBeta, ChallengeGamma, ChallengeX};
 use super::{Argument, ProvingKey};
@@ -14,8 +18,46 @@ use crate::{
         commitment::{Blind, Params},
         Coeff, ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, ProverQuery, Rotation,
     },
+    poly::EvaluationDomain,
     transcript::{EncodedChallenge, TranscriptWrite},
 };
+
+struct PermutationCommitJob<C: CurveAffine> {
+    z_lagrange: Polynomial<C::Scalar, LagrangeCoeff>,
+    blind: Blind<C::Scalar>,
+}
+
+struct PermutationCommitResult<C: CurveAffine> {
+    commitment: C,
+    set: CommittedSet<C>,
+}
+
+impl<C: CurveAffine> PermutationCommitJob<C> {
+    fn execute<'params, P: Params<'params, C>>(
+        self,
+        params: &P,
+        domain: &EvaluationDomain<C::Scalar>,
+    ) -> PermutationCommitResult<C> {
+        let mut stream = IcicleStream::create().unwrap();
+
+        let permutation_product_commitment_projective =
+            params.commit_lagrange_with_stream(&self.z_lagrange, self.blind, &stream);
+        let permutation_product_poly = domain.lagrange_to_coeff_stream(self.z_lagrange, &stream);
+        let permutation_product_coset = domain.coeff_to_extended(&permutation_product_poly, &stream);
+
+        stream.synchronize().unwrap();
+        stream.destroy().unwrap();
+
+        PermutationCommitResult {
+            commitment: permutation_product_commitment_projective.to_affine(),
+            set: CommittedSet {
+                permutation_product_poly,
+                permutation_product_coset,
+                permutation_product_blind: self.blind,
+            },
+        }
+    }
+}
 
 pub(crate) struct CommittedSet<C: CurveAffine> {
     pub(crate) permutation_product_poly: Polynomial<C::Scalar, Coeff>,
@@ -45,7 +87,7 @@ impl Argument {
     pub(in crate::plonk) fn commit<
         'params,
         C: CurveAffine,
-        P: Params<'params, C>,
+        P: Params<'params, C> + Sync,
         E: EncodedChallenge<C>,
         R: RngCore,
         T: TranscriptWrite<C, E>,
@@ -79,118 +121,129 @@ impl Argument {
         let mut last_z = C::Scalar::ONE;
 
         let mut sets = vec![];
-        let mut stream = IcicleStream::create().unwrap();
+        let (job_tx, job_rx) = sync_channel::<PermutationCommitJob<C>>(2);
+        let (result_tx, result_rx) = channel::<PermutationCommitResult<C>>();
+        let mut invert_stream = IcicleStream::create().unwrap();
 
-        for (columns, permutations) in self
-            .columns
-            .chunks(chunk_len)
-            .zip(pkey.permutations.chunks(chunk_len))
-        {
-            // Goal is to compute the products of fractions
-            //
-            // (p_j(\omega^i) + \delta^j \omega^i \beta + \gamma) /
-            // (p_j(\omega^i) + \beta s_j(\omega^i) + \gamma)
-            //
-            // where p_j(X) is the jth column in this permutation,
-            // and i is the ith row of the column.
+        let mut outstanding_jobs = 0usize;
 
-            let mut modified_values = vec![C::Scalar::ONE; params.n() as usize];
-
-            // Iterate over each column of the permutation
-            for (&column, permuted_column_values) in columns.iter().zip(permutations.iter()) {
-                let values = match column.column_type() {
-                    Any::Advice(_) => advice,
-                    Any::Fixed => fixed,
-                    Any::Instance => instance,
-                };
-                parallelize(&mut modified_values, |modified_values, start| {
-                    for ((modified_values, value), permuted_value) in modified_values
-                        .iter_mut()
-                        .zip(values[column.index()][start..].iter())
-                        .zip(permuted_column_values[start..].iter())
-                    {
-                        *modified_values *= &(*beta * permuted_value + &*gamma + value);
+        let scope_result = thread::scope(|scope| -> Result<(), Error> {
+            let worker_rx = job_rx;
+            let worker_tx = result_tx;
+            scope.spawn(move || {
+                while let Ok(job) = worker_rx.recv() {
+                    let result = job.execute(params, domain);
+                    if worker_tx.send(result).is_err() {
+                        break;
                     }
-                });
-            }
-
-            // Invert to obtain the denominator for the permutation product polynomial
-            modified_values = icicle_invert(&modified_values, &stream);
-            // Iterate over each column again, this time finishing the computation
-            // of the entire fraction by computing the numerators
-            for &column in columns.iter() {
-                let omega = domain.get_omega();
-                let values = match column.column_type() {
-                    Any::Advice(_) => advice,
-                    Any::Fixed => fixed,
-                    Any::Instance => instance,
-                };
-                parallelize(&mut modified_values, |modified_values, start| {
-                    let mut deltaomega = deltaomega * &omega.pow_vartime([start as u64, 0, 0, 0]);
-                    for (modified_values, value) in modified_values
-                        .iter_mut()
-                        .zip(values[column.index()][start..].iter())
-                    {
-                        // Multiply by p_j(\omega^i) + \delta^j \omega^i \beta
-                        *modified_values *= &(deltaomega * &*beta + &*gamma + value);
-                        deltaomega *= &omega;
-                    }
-                });
-                deltaomega *= &<C::Scalar as PrimeField>::DELTA;
-            }
-
-            // The modified_values vector is a vector of products of fractions
-            // of the form
-            //
-            // (p_j(\omega^i) + \delta^j \omega^i \beta + \gamma) /
-            // (p_j(\omega^i) + \beta s_j(\omega^i) + \gamma)
-            //
-            // where i is the index into modified_values, for the jth column in
-            // the permutation
-
-            // Compute the evaluations of the permutation product polynomial
-            // over our domain, starting with z[0] = 1
-            let mut z = vec![last_z];
-            for row in 1..(params.n() as usize) {
-                let mut tmp = z[row - 1];
-
-                tmp *= &modified_values[row - 1];
-                z.push(tmp);
-            }
-            let mut z = domain.lagrange_from_vec(z);
-            // Set blinding factors
-            for z in &mut z[params.n() as usize - blinding_factors..] {
-                *z = C::Scalar::random(&mut rng);
-            }
-            // Set new last_z
-            last_z = z[params.n() as usize - (blinding_factors + 1)];
-
-            let blind = Blind(C::Scalar::random(&mut rng));
-            let permutation_product_commitment_projective =
-                params.commit_lagrange_with_stream(&z, blind, &stream);
-            let permutation_product_blind = blind;
-            let z = domain.lagrange_to_coeff_stream(z, &stream);
-            let permutation_product_poly = z.clone();
-            let permutation_product_coset = domain.coeff_to_extended(&z, &stream);
-
-            stream.synchronize().unwrap();
-            stream.destroy().unwrap();
-
-            let permutation_product_commitment =
-                permutation_product_commitment_projective.to_affine();
-
-            // Hash the permutation product commitment
-            transcript.write_point(permutation_product_commitment)?;
-
-            sets.push(CommittedSet {
-                permutation_product_poly,
-                permutation_product_coset,
-                permutation_product_blind,
+                }
             });
-        }
 
-        stream.synchronize().unwrap();
-        stream.destroy().unwrap();
+            for (columns, permutations) in self
+                .columns
+                .chunks(chunk_len)
+                .zip(pkey.permutations.chunks(chunk_len))
+            {
+                let mut modified_values = vec![C::Scalar::ONE; params.n() as usize];
+
+                for (&column, permuted_column_values) in columns.iter().zip(permutations.iter()) {
+                    let values = match column.column_type() {
+                        Any::Advice(_) => advice,
+                        Any::Fixed => fixed,
+                        Any::Instance => instance,
+                    };
+                    parallelize(&mut modified_values, |modified_values, start| {
+                        for ((modified_values, value), permuted_value) in modified_values
+                            .iter_mut()
+                            .zip(values[column.index()][start..].iter())
+                            .zip(permuted_column_values[start..].iter())
+                        {
+                            *modified_values *= &(*beta * permuted_value + &*gamma + value);
+                        }
+                    });
+                }
+
+                modified_values = icicle_invert(&modified_values, &invert_stream);
+                for &column in columns.iter() {
+                    let omega = domain.get_omega();
+                    let values = match column.column_type() {
+                        Any::Advice(_) => advice,
+                        Any::Fixed => fixed,
+                        Any::Instance => instance,
+                    };
+                    parallelize(&mut modified_values, |modified_values, start| {
+                        let mut deltaomega = deltaomega * &omega.pow_vartime([start as u64, 0, 0, 0]);
+                        for (modified_values, value) in modified_values
+                            .iter_mut()
+                            .zip(values[column.index()][start..].iter())
+                        {
+                            *modified_values *= &(deltaomega * &*beta + &*gamma + value);
+                            deltaomega *= &omega;
+                        }
+                    });
+                    deltaomega *= &<C::Scalar as PrimeField>::DELTA;
+                }
+
+                let mut z = vec![last_z];
+                for row in 1..(params.n() as usize) {
+                    let mut tmp = z[row - 1];
+
+                    tmp *= &modified_values[row - 1];
+                    z.push(tmp);
+                }
+                let mut z = domain.lagrange_from_vec(z);
+                for z in &mut z[params.n() as usize - blinding_factors..] {
+                    *z = C::Scalar::random(&mut rng);
+                }
+                last_z = z[params.n() as usize - (blinding_factors + 1)];
+
+                let blind = Blind(C::Scalar::random(&mut rng));
+                job_tx
+                    .send(PermutationCommitJob {
+                        z_lagrange: z,
+                        blind,
+                    })
+                    .unwrap();
+                outstanding_jobs += 1;
+
+                loop {
+                    match result_rx.try_recv() {
+                        Ok(result) => {
+                            transcript.write_point(result.commitment)?;
+                            sets.push(result.set);
+                            outstanding_jobs -= 1;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            if outstanding_jobs == 0 {
+                                break;
+                            }
+                            return Err(Error::Opening);
+                        }
+                    }
+                }
+            }
+
+            while outstanding_jobs > 0 {
+                match result_rx.recv() {
+                    Ok(result) => {
+                        transcript.write_point(result.commitment)?;
+                        sets.push(result.set);
+                        outstanding_jobs -= 1;
+                    }
+                    Err(_) => return Err(Error::Opening),
+                }
+            }
+
+            drop(job_tx);
+
+            Ok(())
+        });
+
+        invert_stream.synchronize().unwrap();
+        invert_stream.destroy().unwrap();
+
+        scope_result?;
 
         Ok(Committed { sets })
     }

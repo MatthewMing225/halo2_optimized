@@ -3,13 +3,14 @@ use super::super::{
 };
 use super::Argument;
 use crate::helpers::SerdeCurveAffine;
+use crate::icicle::device_vec_from_c_scalars;
 use crate::plonk::evaluation::evaluate;
 use crate::SerdeFormat;
 use crate::{
     arithmetic::{eval_polynomial, CurveAffine},
     icicle::{
-        c_scalars_from_device_vec, device_vec_from_c_scalars, icicle_scalars_from_c_scalars,
-        inplace_add, inplace_invert, inplace_mul, inplace_scalar_add, inplace_sub,
+        c_scalars_from_device_vec, inplace_add, inplace_invert, inplace_mul,
+        inplace_scalar_add, inplace_sub,
     },
     poly::{
         commitment::{Blind, Params},
@@ -19,6 +20,7 @@ use crate::{
 };
 use ff::{PrimeField, WithSmallOrderMulGroup};
 use group::{ff::Field, Curve};
+use icicle_core::traits::FieldImpl;
 use icicle_runtime::{
     memory::{DeviceVec, HostSlice},
     stream::IcicleStream,
@@ -32,26 +34,109 @@ use maybe_rayon::prelude::{
 };
 use std::{
     borrow::Borrow,
+    cell::RefCell,
     iter,
     ops::{Mul, MulAssign},
     slice,
 };
 
+const MAX_SCALAR_KEY_BYTES: usize = 64;
+
 #[derive(Clone, Eq, PartialEq, Hash)]
-struct ScalarKey(Box<[u8]>);
+struct ScalarKey {
+    len: u8,
+    bytes: [u8; MAX_SCALAR_KEY_BYTES],
+}
 
 impl ScalarKey {
+    #[inline]
     fn from_scalar<F>(value: &F) -> Self
     where
         F: PrimeField,
     {
-        ScalarKey(value.to_repr().as_ref().into())
+        let repr = value.to_repr();
+        let repr_bytes = repr.as_ref();
+        assert!(
+            repr_bytes.len() <= MAX_SCALAR_KEY_BYTES,
+            "scalar representation longer than MAX_SCALAR_KEY_BYTES"
+        );
+        let mut bytes = [0u8; MAX_SCALAR_KEY_BYTES];
+        bytes[..repr_bytes.len()].copy_from_slice(repr_bytes);
+        ScalarKey {
+            len: repr_bytes.len() as u8,
+            bytes,
+        }
     }
+}
+
+struct GrandSumWorkspace {
+    accumulator: Option<DeviceVec<ScalarField>>,
+    temp: Option<DeviceVec<ScalarField>>,
+    m_values: Option<DeviceVec<ScalarField>>,
+    table: Option<DeviceVec<ScalarField>>,
+    zero_host: Vec<ScalarField>,
+    capacity: usize,
+}
+
+impl GrandSumWorkspace {
+    fn new() -> Self {
+        GrandSumWorkspace {
+            accumulator: None,
+            temp: None,
+            m_values: None,
+            table: None,
+            zero_host: Vec::new(),
+            capacity: 0,
+        }
+    }
+
+    fn ensure_capacity(&mut self, len: usize) {
+        if self.capacity >= len {
+            return;
+        }
+
+        self.accumulator = Some(DeviceVec::device_malloc(len).expect("allocate accumulator"));
+        self.temp = Some(DeviceVec::device_malloc(len).expect("allocate temp buffer"));
+        self.m_values = Some(DeviceVec::device_malloc(len).expect("allocate m buffer"));
+        self.table = Some(DeviceVec::device_malloc(len).expect("allocate table buffer"));
+        self.zero_host.resize(len, ScalarField::zero());
+        self.capacity = len;
+    }
+
+    fn zero_accumulator(&mut self, stream: &IcicleStream, len: usize) {
+        let host_slice = unsafe {
+            HostSlice::from_slice(slice::from_raw_parts(self.zero_host.as_ptr(), len))
+        };
+        self
+            .accumulator
+            .as_mut()
+            .expect("grand-sum accumulator not initialized")
+            .copy_from_host_async(host_slice, stream)
+            .expect("zero accumulator");
+    }
+
+    fn copy_polynomial<C: CurveAffine>(
+        stream: &IcicleStream,
+        dest: &mut DeviceVec<ScalarField>,
+        poly: &Polynomial<C::Scalar, LagrangeCoeff>,
+    ) {
+        let values: &[C::Scalar] = poly.as_ref();
+        let icicle_values: &[ScalarField] = unsafe {
+            slice::from_raw_parts(values.as_ptr() as *const ScalarField, values.len())
+        };
+        let host_slice = HostSlice::from_slice(icicle_values);
+        dest.copy_from_host_async(host_slice, stream)
+            .expect("copy polynomial to device");
+    }
+}
+thread_local! {
+    static GRAND_SUM_WORKSPACE: RefCell<GrandSumWorkspace> = RefCell::new(GrandSumWorkspace::new());
+    static GRAND_SUM_STREAM: RefCell<IcicleStream> = RefCell::new(IcicleStream::create().expect("failed to create mv-lookup stream"));
 }
 
 impl Borrow<[u8]> for ScalarKey {
     fn borrow(&self) -> &[u8] {
-        &self.0
+        &self.bytes[..self.len as usize]
     }
 }
 
@@ -301,169 +386,208 @@ impl<C: CurveAffine> Prepared<C> {
         */
 
         let total_start = instant::Instant::now();
-        let start = instant::Instant::now();
+        let log_derivative_start = instant::Instant::now();
         log::info!("mv_lookup::commit_grand_sum: start");
-        let mut stream = IcicleStream::create().unwrap();
-        let icicle_beta = device_vec_from_c_scalars(&[*beta], &stream);
 
-        // ∑ 1/(φ_i(X))
-        let inputs_log_derivatives = vec![C::Scalar::ZERO; params.n() as usize];
-        let mut d_inputs_log_derivatives =
-            device_vec_from_c_scalars(&inputs_log_derivatives, &stream);
-        let mut d_temp = DeviceVec::device_malloc(params.n() as usize).unwrap();
-        let mut d_m_values = device_vec_from_c_scalars(&self.m_values, &stream);
-        let mut d_compressed_table_expression =
-            device_vec_from_c_scalars(&self.compressed_table_expression, &stream);
+        let Prepared {
+            compressed_inputs_expressions,
+            compressed_table_expression,
+            m_values,
+            commitment: _,
+        } = self;
 
-        for compressed_input_expression in self.compressed_inputs_expressions.iter() {
-            let values: &[C::Scalar] = compressed_input_expression.as_ref();
-            // SAFETY: halo2's scalar representation matches Icicle's `ScalarField` layout (bn254 Fr),
-            // so we can reinterpret the slice without copying the limbs.
-            let icicle_values: &[ScalarField] = unsafe {
-                slice::from_raw_parts(values.as_ptr() as *const ScalarField, values.len())
-            };
-            let host_slice = HostSlice::from_slice(icicle_values);
-            d_temp.copy_from_host_async(host_slice, &stream).unwrap();
+        let n = params.n() as usize;
 
-            inplace_scalar_add(&mut d_temp, &icicle_beta, &stream);
-            inplace_invert(&mut d_temp, &stream);
-            inplace_add(&mut d_inputs_log_derivatives, &d_temp, &stream);
-        }
+        let committed = GRAND_SUM_STREAM.with(|stream_cell| {
+            GRAND_SUM_WORKSPACE.with(|workspace_cell| {
+                let stream = stream_cell.borrow_mut();
+                let stream_ref = &*stream;
+                let mut workspace = workspace_cell.borrow_mut();
+                workspace.ensure_capacity(n);
+                workspace.zero_accumulator(stream_ref, n);
 
-        inplace_scalar_add(&mut d_compressed_table_expression, &icicle_beta, &stream);
-        inplace_invert(&mut d_compressed_table_expression, &stream);
+                let beta_device = device_vec_from_c_scalars(&[*beta], stream_ref);
 
-        inplace_mul(&mut d_m_values, &d_compressed_table_expression, &stream);
-        inplace_sub(&mut d_inputs_log_derivatives, &d_m_values, &stream);
+                let mut accumulator_buf = workspace
+                    .accumulator
+                    .take()
+                    .expect("grand-sum accumulator not initialized");
+                let mut temp_buf = workspace
+                    .temp
+                    .take()
+                    .expect("grand-sum temp buffer not initialized");
+                let mut m_values_buf = workspace
+                    .m_values
+                    .take()
+                    .expect("grand-sum m buffer not initialized");
+                let mut table_buf = workspace
+                    .table
+                    .take()
+                    .expect("grand-sum table buffer not initialized");
 
-        let log_derivatives_diff: Vec<C::Scalar> =
-            c_scalars_from_device_vec(&mut d_inputs_log_derivatives, &stream);
+                GrandSumWorkspace::copy_polynomial::<C>(
+                    stream_ref,
+                    &mut m_values_buf,
+                    &m_values,
+                );
 
-        stream.synchronize().unwrap();
-        stream.destroy().unwrap();
+                GrandSumWorkspace::copy_polynomial::<C>(
+                    stream_ref,
+                    &mut table_buf,
+                    &compressed_table_expression,
+                );
 
-        log::info!(
-            "mv_lookup::commit_grand_sum: log-derivatives computed in {:.3?}",
-            start.elapsed()
-        );
+                for compressed_input_expression in &compressed_inputs_expressions {
+                    GrandSumWorkspace::copy_polynomial::<C>(
+                        stream_ref,
+                        &mut temp_buf,
+                        compressed_input_expression,
+                    );
+                    inplace_scalar_add(&mut temp_buf, &beta_device, stream_ref);
+                    inplace_invert(&mut temp_buf, stream_ref);
+                    inplace_add(&mut accumulator_buf, &temp_buf, stream_ref);
+                }
 
-        let start = instant::Instant::now();
-        // Compute the evaluations of the lookup grand sum polynomial
-        // over our domain, starting with phi[0] = 0
-        let blinding_factors = vk.cs.blinding_factors();
+                inplace_scalar_add(&mut table_buf, &beta_device, stream_ref);
+                inplace_invert(&mut table_buf, stream_ref);
 
-        assert!(
-            phi_blinds.len() == blinding_factors,
-            "invalid number of blinding factors"
-        );
+                inplace_mul(&mut m_values_buf, &mut table_buf, stream_ref);
+                inplace_sub(&mut accumulator_buf, &mut m_values_buf, stream_ref);
 
-        let phi = iter::once(C::Scalar::ZERO)
-            .chain(log_derivatives_diff)
-            .scan(C::Scalar::ZERO, |state, cur| {
-                *state += &cur;
-                Some(*state)
-            })
-            // Take all rows including the "last" row which should
-            // be a 0
-            .take(params.n() as usize - blinding_factors)
-            // Chain random blinding factors.
-            .chain(phi_blinds.into_iter().map(|&x| x))
-            .collect::<Vec<_>>();
-        assert_eq!(phi.len(), params.n() as usize);
-        let phi = vk.domain.lagrange_from_vec(phi);
+                let log_derivatives_diff: Vec<C::Scalar> =
+                    c_scalars_from_device_vec(&mut accumulator_buf, stream_ref);
 
-        log::info!(
-            "mv_lookup::commit_grand_sum: phi constructed in {:.3?}",
-            start.elapsed()
-        );
+                log::info!(
+                    "mv_lookup::commit_grand_sum: log-derivatives computed in {:.3?}",
+                    log_derivative_start.elapsed()
+                );
 
-        #[cfg(feature = "sanity-checks")]
-        // This test works only with intermediate representations in this method.
-        // It can be used for debugging purposes.
-        {
-            // While in Lagrange basis, check that product is correctly constructed
-            let u = (params.n() as usize) - (blinding_factors + 1);
+                let phi_start = instant::Instant::now();
+                let blinding_factors = vk.cs.blinding_factors();
 
-            /*
-                φ_i(X) = f_i(X) + α
-                τ(X) = t(X) + α
-                LHS = τ(X) * Π(φ_i(X)) * (ϕ(gX) - ϕ(X))
-                RHS = τ(X) * Π(φ_i(X)) * (∑ 1/(φ_i(X)) - m(X) / τ(X))))
-            */
+                assert!(
+                    phi_blinds.len() == blinding_factors,
+                    "invalid number of blinding factors"
+                );
 
-            // q(X) = LHS - RHS mod zH(X)
-            for i in 0..u {
-                // Π(φ_i(X))
-                let fi_prod = || {
-                    let mut prod = C::Scalar::ONE;
-                    for compressed_input_expression in self.compressed_inputs_expressions.iter() {
-                        prod *= *beta + compressed_input_expression[i];
-                    }
+                let phi_values = iter::once(C::Scalar::ZERO)
+                    .chain(log_derivatives_diff)
+                    .scan(C::Scalar::ZERO, |state, cur| {
+                        *state += &cur;
+                        Some(*state)
+                    })
+                    .take(n - blinding_factors)
+                    .chain(phi_blinds.iter().copied())
+                    .collect::<Vec<_>>();
+                assert_eq!(phi_values.len(), n);
 
-                    prod
-                };
+                #[cfg(feature = "sanity-checks")]
+                let phi_for_checks = phi_values.clone();
 
-                let fi_log_derivative = || {
-                    let mut sum = C::Scalar::ZERO;
-                    for compressed_input_expression in self.compressed_inputs_expressions.iter() {
-                        sum += (*beta + compressed_input_expression[i]).invert().unwrap();
-                    }
+                let phi_lagrange = vk.domain.lagrange_from_vec(phi_values);
 
-                    sum
-                };
+                log::info!(
+                    "mv_lookup::commit_grand_sum: phi constructed in {:.3?}",
+                    phi_start.elapsed()
+                );
 
-                // LHS = τ(X) * Π(φ_i(X)) * (ϕ(gX) - ϕ(X))
-                let lhs = {
-                    (*beta + self.compressed_table_expression[i])
-                        * fi_prod()
-                        * (phi[i + 1] - phi[i])
-                };
+            #[cfg(feature = "sanity-checks")]
+            // This test works only with intermediate representations in this method.
+            // It can be used for debugging purposes.
+            {
+                // While in Lagrange basis, check that product is correctly constructed
+                let u = n - (blinding_factors + 1);
 
-                // RHS = τ(X) * Π(φ_i(X)) * (∑ 1/(φ_i(X)) - m(X) / τ(X))))
-                let rhs = {
-                    (*beta + self.compressed_table_expression[i])
-                        * fi_prod()
-                        * (fi_log_derivative()
-                            - self.m_values[i]
-                                * (*beta + self.compressed_table_expression[i])
-                                    .invert()
-                                    .unwrap())
-                };
+                /*
+                    φ_i(X) = f_i(X) + α
+                    τ(X) = t(X) + α
+                    LHS = τ(X) * Π(φ_i(X)) * (ϕ(gX) - ϕ(X))
+                    RHS = τ(X) * Π(φ_i(X)) * (∑ 1/(φ_i(X)) - m(X) / τ(X))))
+                */
 
-                assert_eq!(lhs - rhs, C::Scalar::ZERO);
+                // q(X) = LHS - RHS mod zH(X)
+                for i in 0..u {
+                    // Π(φ_i(X))
+                    let fi_prod = || {
+                        let mut prod = C::Scalar::ONE;
+                        for compressed_input_expression in compressed_inputs_expressions.iter() {
+                            prod *= *beta + compressed_input_expression[i];
+                        }
+
+                        prod
+                    };
+
+                    let fi_log_derivative = || {
+                        let mut sum = C::Scalar::ZERO;
+                        for compressed_input_expression in compressed_inputs_expressions.iter() {
+                            sum += (*beta + compressed_input_expression[i]).invert().unwrap();
+                        }
+
+                        sum
+                    };
+
+                    // LHS = τ(X) * Π(φ_i(X)) * (ϕ(gX) - ϕ(X))
+                    let lhs = {
+                        (*beta + compressed_table_expression[i])
+                            * fi_prod()
+                            * (phi_for_checks[i + 1] - phi_for_checks[i])
+                    };
+
+                    // RHS = τ(X) * Π(φ_i(X)) * (∑ 1/(φ_i(X)) - m(X) / τ(X))))
+                    let rhs = {
+                        (*beta + compressed_table_expression[i])
+                            * fi_prod()
+                            * (fi_log_derivative()
+                                - m_values[i]
+                                    * (*beta + compressed_table_expression[i])
+                                        .invert()
+                                        .unwrap())
+                    };
+
+                    assert_eq!(lhs - rhs, C::Scalar::ZERO);
+                }
+
+                assert_eq!(phi_for_checks[u], C::Scalar::ZERO);
             }
 
-            assert_eq!(phi[u], C::Scalar::ZERO);
-        }
+                let grand_sum_blind = Blind(C::Scalar::ZERO);
+                let commitment_start = instant::Instant::now();
+                let phi_commitment = params
+                    .commit_lagrange_with_stream(&phi_lagrange, grand_sum_blind, stream_ref)
+                    .to_affine();
+                log::info!(
+                    "mv_lookup::commit_grand_sum: phi commitment in {:.3?}",
+                    commitment_start.elapsed()
+                );
 
-        let grand_sum_blind = Blind(C::Scalar::ZERO);
-        let start = instant::Instant::now();
-        let phi_commitment = params
-            .commit_lagrange_with_stream(&phi, grand_sum_blind, &stream)
-            .to_affine();
-        log::info!(
-            "mv_lookup::commit_grand_sum: phi commitment in {:.3?}",
-            start.elapsed()
-        );
+                let m_poly = vk
+                    .domain
+                    .lagrange_to_coeff_stream(m_values, stream_ref);
+                let phi_poly = vk
+                    .domain
+                    .lagrange_to_coeff_stream(phi_lagrange, stream_ref);
 
-        // Hash grand sum commitment
-        // transcript.write_point(phi_commitment)?;
+                stream_ref.synchronize().unwrap();
 
-        let m_poly = vk.domain.lagrange_to_coeff_stream(self.m_values, &stream);
-        let phi_poly = vk.domain.lagrange_to_coeff_stream(phi, &stream);
+                workspace.accumulator = Some(accumulator_buf);
+                workspace.temp = Some(temp_buf);
+                workspace.m_values = Some(m_values_buf);
+                workspace.table = Some(table_buf);
 
-        stream.synchronize().unwrap();
-        stream.destroy().unwrap();
+                Committed {
+                    m_poly,
+                    phi_poly,
+                    commitment: phi_commitment,
+                }
+            })
+        });
+
         log::info!(
             "mv_lookup::commit_grand_sum: completed in {:.3?}",
             total_start.elapsed()
         );
 
-        Ok(Committed {
-            m_poly,
-            phi_poly,
-            commitment: phi_commitment,
-        })
+        Ok(committed)
     }
 }
 
