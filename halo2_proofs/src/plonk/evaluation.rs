@@ -11,13 +11,10 @@ use crate::plonk::mv_lookup as lookup;
 use crate::plonk::lookup;
 
 use crate::{
-    poly::Basis,
-    util::timing::TimingScope,
-};
-use crate::{
     arithmetic::{parallelize, CurveAffine},
     poly::{Coeff, ExtendedLagrangeCoeff, Polynomial, Rotation},
 };
+use crate::{poly::Basis, util::timing::TimingScope};
 
 use group::ff::{Field, PrimeField, WithSmallOrderMulGroup};
 use icicle_bn254::curve::ScalarField;
@@ -37,6 +34,29 @@ use maybe_rayon::{join, prelude::*};
 
 use super::{shuffle, ConstraintSystem, Expression};
 use instant::Instant;
+use std::cell::RefCell;
+
+thread_local! {
+    static FFT_STREAM: RefCell<Option<IcicleStream>> = RefCell::new(None);
+}
+
+fn with_fft_stream<R, F>(f: F) -> R
+where
+    F: FnOnce(&mut IcicleStream) -> R,
+{
+    FFT_STREAM.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if guard.is_none() {
+            *guard = Some(IcicleStream::create().expect("failed to create FFT stream"));
+        }
+        let stream = guard.as_mut().unwrap();
+        let result = f(stream);
+        stream
+            .synchronize()
+            .expect("failed to synchronize fft stream");
+        result
+    })
+}
 
 /// Return the index in the polynomial of size `isize` after rotation `rot`.
 fn get_rotation_idx(idx: usize, rot: i32, rot_scale: i32, isize: i32) -> usize {
@@ -416,48 +436,21 @@ impl<C: CurveAffine> Evaluator<C> {
 
         let mut values = domain.empty_extended();
 
-        // Core expression evaluations
-        struct StreamGuard(IcicleStream);
-
-        impl StreamGuard {
-            fn new() -> Self {
-                StreamGuard(IcicleStream::create().expect("failed to create FFT stream"))
-            }
-
-            fn stream(&self) -> &IcicleStream {
-                &self.0
-            }
-        }
-
-        impl Drop for StreamGuard {
-            fn drop(&mut self) {
-                self.0
-                    .destroy()
-                    .expect("failed to destroy FFT stream in evaluate_h");
-            }
-        }
-
-        let convert_coeff_to_extended = |polys: &[Polynomial<C::Scalar, Coeff>]| {
+        let convert_coeff_to_extended = |polys: &[Polynomial<C::ScalarExt, Coeff>]| {
             polys
                 .par_iter()
-                .map_init(StreamGuard::new, |stream, poly| {
-                    let result = domain.coeff_to_extended(poly, stream.stream());
-                    stream
-                        .stream()
-                        .synchronize()
-                        .expect("failed to synchronize coeff_to_extended");
-                    result
-                })
+                .map(|poly| with_fft_stream(|stream| domain.coeff_to_extended(poly, stream)))
                 .collect::<Vec<_>>()
         };
 
-        for (iteration_idx, ((((advice, instance), lookups), shuffles), permutation)) in advice_polys
-            .iter()
-            .zip(instance_polys.iter())
-            .zip(lookups.iter())
-            .zip(shuffles.iter())
-            .zip(permutations.iter())
-            .enumerate()
+        for (iteration_idx, ((((advice, instance), lookups), shuffles), permutation)) in
+            advice_polys
+                .iter()
+                .zip(instance_polys.iter())
+                .zip(lookups.iter())
+                .zip(shuffles.iter())
+                .zip(permutations.iter())
+                .enumerate()
         {
             let iteration_scope = eval_scope.child(format!("iteration {}", iteration_idx));
             let _iteration_start = Instant::now();
@@ -694,22 +687,24 @@ impl<C: CurveAffine> Evaluator<C> {
                     let ((m_coset, phi_coset), (inputs_inv_sums, (inputs_prods, table_values))) =
                         join(
                             || {
-                                let mut stream_m_poly = IcicleStream::create().unwrap();
-                                let mut stream_phi_poly = IcicleStream::create().unwrap();
-
-                                let m_coset = domain
-                                    .coeff_to_extended_device_vec(&lookup.m_poly, &stream_m_poly);
-                                let phi_coset = domain.coeff_to_extended_device_vec(
-                                    &lookup.phi_poly,
-                                    &stream_phi_poly,
-                                );
-
-                                stream_m_poly.synchronize().unwrap();
-                                stream_phi_poly.synchronize().unwrap();
-                                stream_m_poly.destroy().unwrap();
-                                stream_phi_poly.destroy().unwrap();
-
-                                (m_coset, phi_coset)
+                                join(
+                                    || {
+                                        with_fft_stream(|stream| {
+                                            domain.coeff_to_extended_device_vec(
+                                                &lookup.m_poly,
+                                                stream,
+                                            )
+                                        })
+                                    },
+                                    || {
+                                        with_fft_stream(|stream| {
+                                            domain.coeff_to_extended_device_vec(
+                                                &lookup.phi_poly,
+                                                stream,
+                                            )
+                                        })
+                                    },
+                                )
                             },
                             || {
                                 join(
@@ -1108,32 +1103,21 @@ impl<C: CurveAffine> Evaluator<C> {
 
                     #[cfg(not(feature = "precompute-coset"))]
                     let (product_coset, permuted_input_coset, permuted_table_coset) = {
-                        let mut stream_coset = IcicleStream::create().unwrap();
-                        let mut stream_input_coset = IcicleStream::create().unwrap();
-                        let mut stream_table_coset = IcicleStream::create().unwrap();
+                        let product = with_fft_stream(|stream| {
+                            pk.vk.domain.coeff_to_extended(&lookup.product_poly, stream)
+                        });
+                        let permuted_input = with_fft_stream(|stream| {
+                            pk.vk
+                                .domain
+                                .coeff_to_extended(&lookup.permuted_input_poly, stream)
+                        });
+                        let permuted_table = with_fft_stream(|stream| {
+                            pk.vk
+                                .domain
+                                .coeff_to_extended(&lookup.permuted_table_poly, stream)
+                        });
 
-                        let product_coset = pk
-                            .vk
-                            .domain
-                            .coeff_to_extended(&lookup.product_poly, &stream_coset);
-                        let permuted_input_coset = pk
-                            .vk
-                            .domain
-                            .coeff_to_extended(&lookup.permuted_input_poly, &stream_input_coset);
-                        let permuted_table_coset = pk
-                            .vk
-                            .domain
-                            .coeff_to_extended(&lookup.permuted_table_poly, &stream_table_coset);
-
-                        stream_coset.synchronize().unwrap();
-                        stream_input_coset.synchronize().unwrap();
-                        stream_table_coset.synchronize().unwrap();
-
-                        stream_coset.destroy().unwrap();
-                        stream_input_coset.destroy().unwrap();
-                        stream_table_coset.destroy().unwrap();
-
-                        (product_coset, permuted_input_coset, permuted_table_coset)
+                        (product, permuted_input, permuted_table)
                     };
 
                     // Lookup constraints

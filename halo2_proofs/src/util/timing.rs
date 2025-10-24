@@ -10,7 +10,9 @@ fn timing_enabled() -> bool {
     *ENABLED.get_or_init(|| match env::var("HALO2_TIMING") {
         Ok(value) => {
             let value = value.trim();
-            !(value.is_empty() || value.eq_ignore_ascii_case("0") || value.eq_ignore_ascii_case("false"))
+            !(value.is_empty()
+                || value.eq_ignore_ascii_case("0")
+                || value.eq_ignore_ascii_case("false"))
         }
         Err(_) => false,
     })
@@ -61,11 +63,7 @@ impl TimingScope {
     pub fn child(&self, label: impl Into<Cow<'static, str>>) -> TimingScope {
         let label = label.into();
         if self.enabled {
-            log::info!(
-                "[timing] {}{}: start",
-                indent(self.depth + 1),
-                label
-            );
+            log::info!("[timing] {}{}: start", indent(self.depth + 1), label);
         }
         TimingScope {
             label,
