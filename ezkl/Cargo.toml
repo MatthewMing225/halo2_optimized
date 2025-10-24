@@ -1,0 +1,15 @@
+[package]
+name = "ezkl"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+thread-safe-region = []
+parallel-synthesis = ["halo2_proofs/parallel-synthesis"]
+
+[dependencies]
+halo2_proofs = { path = "../halo2_proofs", features = ["parallel-synthesis"] }
+
+[dev-dependencies]
+anyhow = "1"
