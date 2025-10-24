@@ -238,9 +238,10 @@ impl<F: SerdePrimeField, B> Polynomial<F, B> {
     }
 }
 
-pub(crate) fn batch_invert_assigned<F: Field>(
-    assigned: Vec<Polynomial<Assigned<F>, LagrangeCoeff>>,
+pub(crate) fn batch_invert_assigned<'a, F: Field>(
+    assigned: impl IntoIterator<Item = &'a Polynomial<Assigned<F>, LagrangeCoeff>>,
 ) -> Vec<Polynomial<F, LagrangeCoeff>> {
+    let assigned: Vec<_> = assigned.into_iter().collect();
     let mut assigned_denominators: Vec<_> = assigned
         .par_iter()
         .map(|f| {
@@ -261,7 +262,7 @@ pub(crate) fn batch_invert_assigned<F: Field>(
         .batch_invert();
 
     assigned
-        .iter()
+        .into_iter()
         .zip(assigned_denominators)
         .map(|(poly, inv_denoms)| poly.invert(inv_denoms.into_iter().map(|d| d.unwrap_or(F::ONE))))
         .collect()
