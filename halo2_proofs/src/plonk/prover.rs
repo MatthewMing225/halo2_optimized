@@ -40,6 +40,7 @@ use crate::{
         commitment::{Blind, CommitmentScheme, Params, Prover},
         Basis, Coeff, LagrangeCoeff, Polynomial, ProverQuery,
     },
+    util::timing::TimingScope,
 };
 use crate::{
     poly::batch_invert_assigned,
@@ -126,6 +127,8 @@ where
             return Err(Error::InvalidInstances);
         }
     }
+
+    let proof_scope = TimingScope::root("plonk::create_proof");
 
     let start = Instant::now();
     // Hash verification key into transcript
@@ -409,6 +412,7 @@ where
         for (current_phase, column_indices) in phase_column_indices.iter() {
             let phase_start = Instant::now();
             log::info!("advice phase {:?} started", current_phase);
+            let _phase_scope = proof_scope.child(format!("advice phase {:?}", current_phase));
             let phase_value = *current_phase;
             let unblinded_advice_columns: HashSet<usize> =
                 HashSet::from_iter(meta.unblinded_advice_columns.clone());
@@ -809,6 +813,12 @@ where
             })
             .collect::<Result<Vec<_>, _>>()
     };
+    #[cfg(feature = "mv-lookup")]
+    let lookups = {
+        let _lookup_scope = proof_scope.child("mv_lookup::commit_grand_sum");
+        commit_lookups()?
+    };
+    #[cfg(not(feature = "mv-lookup"))]
     let lookups = commit_lookups()?;
     #[cfg(feature = "mv-lookup")]
     log::info!(
@@ -881,25 +891,28 @@ where
     let EvaluateHOutput {
         host_poly: h_poly,
         device_values: h_device_values,
-    } = pk.ev.evaluate_h(
-        pk,
-        &advice
-            .iter()
-            .map(|a| a.advice_polys.as_slice())
-            .collect::<Vec<_>>(),
-        &instance
-            .iter()
-            .map(|i| i.instance_polys.as_slice())
-            .collect::<Vec<_>>(),
-        &challenges,
-        *y,
-        *beta,
-        *gamma,
-        *theta,
-        &lookups,
-        &shuffles,
-        &permutations,
-    );
+    } = {
+        let _evaluate_scope = proof_scope.child("evaluation::evaluate_h");
+        pk.ev.evaluate_h(
+            pk,
+            &advice
+                .iter()
+                .map(|a| a.advice_polys.as_slice())
+                .collect::<Vec<_>>(),
+            &instance
+                .iter()
+                .map(|i| i.instance_polys.as_slice())
+                .collect::<Vec<_>>(),
+            &challenges,
+            *y,
+            *beta,
+            *gamma,
+            *theta,
+            &lookups,
+            &shuffles,
+            &permutations,
+        )
+    };
 
     let post_eval_start = Instant::now();
     log::info!("post-evaluate_h phase: begin");
