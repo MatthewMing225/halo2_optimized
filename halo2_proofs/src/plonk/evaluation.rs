@@ -10,7 +10,10 @@ use crate::plonk::mv_lookup as lookup;
 #[cfg(not(feature = "mv-lookup"))]
 use crate::plonk::lookup;
 
-use crate::poly::Basis;
+use crate::{
+    poly::Basis,
+    util::timing::TimingScope,
+};
 use crate::{
     arithmetic::{parallelize, CurveAffine},
     poly::{Coeff, ExtendedLagrangeCoeff, Polynomial, Rotation},
@@ -30,8 +33,7 @@ use icicle_runtime::{
     memory::{DeviceVec, HostOrDeviceSlice, HostSlice},
     stream::IcicleStream,
 };
-use maybe_rayon::iter::IntoParallelRefIterator;
-use maybe_rayon::iter::ParallelIterator;
+use maybe_rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use maybe_rayon::join;
 
 use super::{shuffle, ConstraintSystem, Expression};
@@ -395,6 +397,7 @@ impl<C: CurveAffine> Evaluator<C> {
         permutations: &[permutation::prover::Committed<C>],
     ) -> EvaluateHOutput<C> {
         log::info!("evaluation::evaluate_h: start");
+        let eval_scope = TimingScope::root("evaluation::evaluate_h::body");
         let total_start = Instant::now();
         let domain = &pk.vk.domain;
         let size = domain.extended_len();
@@ -415,46 +418,32 @@ impl<C: CurveAffine> Evaluator<C> {
         let mut values = domain.empty_extended();
 
         // Core expression evaluations
-        for ((((advice, instance), lookups), shuffles), permutation) in advice_polys
+        for (iteration_idx, ((((advice, instance), lookups), shuffles), permutation)) in advice_polys
             .iter()
             .zip(instance_polys.iter())
             .zip(lookups.iter())
             .zip(shuffles.iter())
             .zip(permutations.iter())
+            .enumerate()
         {
+            let iteration_scope = eval_scope.child(format!("iteration {}", iteration_idx));
             let _iteration_start = Instant::now();
-            let (instance, advice) = join(
-                || {
-                    let instance: Vec<Polynomial<C::Scalar, ExtendedLagrangeCoeff>> = instance
-                        .par_iter()
-                        .map(|poly| {
-                            let mut stream = IcicleStream::create().unwrap();
-                            let result = domain.coeff_to_extended(poly, &stream);
-                            stream.synchronize().unwrap();
-                            stream.destroy().unwrap();
+            let _coset_scope = iteration_scope.child("coset conversions");
 
-                            result
-                        })
-                        .collect();
+            let convert = |polys: &[Polynomial<C::ScalarExt, Coeff>]| {
+                polys
+                    .par_iter()
+                    .map(|poly| {
+                        let mut stream = IcicleStream::create().unwrap();
+                        let result = domain.coeff_to_extended(poly, &stream);
+                        stream.synchronize().unwrap();
+                        stream.destroy().unwrap();
+                        result
+                    })
+                    .collect::<Vec<_>>()
+            };
 
-                    instance
-                },
-                || {
-                    let advice: Vec<Polynomial<C::Scalar, ExtendedLagrangeCoeff>> = advice
-                        .par_iter()
-                        .map(|poly| {
-                            let mut stream = IcicleStream::create().unwrap();
-                            let result = domain.coeff_to_extended(poly, &stream);
-                            stream.synchronize().unwrap();
-                            stream.destroy().unwrap();
-
-                            result
-                        })
-                        .collect();
-
-                    advice
-                },
-            );
+            let (instance, advice) = join(|| convert(instance), || convert(advice));
 
             let (
                 icicle_advice,
@@ -575,7 +564,11 @@ impl<C: CurveAffine> Evaluator<C> {
                 let halo2_result: Vec<C::ScalarExt> =
                     c_scalars_from_device_vec(&mut d_result, &IcicleStream::default());
 
-                values = Polynomial::from_vec(halo2_result);
+                if values.num_coeffs() == halo2_result.len() {
+                    values[..].clone_from_slice(&halo2_result);
+                } else {
+                    values = Polynomial::from_vec(halo2_result);
+                }
             }
 
             // Permutations
@@ -1057,7 +1050,11 @@ impl<C: CurveAffine> Evaluator<C> {
 
                 let result: Vec<C::ScalarExt> =
                     c_scalars_from_device_vec(&mut icicle_previous_value, &IcicleStream::default());
-                values = Polynomial::from_vec(result);
+                if values.num_coeffs() == result.len() {
+                    values[..].clone_from_slice(&result);
+                } else {
+                    values = Polynomial::from_vec(result);
+                }
             }
 
             #[cfg(all(not(feature = "mv-lookup"), feature = "precompute-coset"))]
