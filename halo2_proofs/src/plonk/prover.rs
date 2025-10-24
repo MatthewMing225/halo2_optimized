@@ -148,12 +148,13 @@ where
     let meta = &pk.vk.cs;
 
     #[cfg(feature = "parallel-synthesis")]
-    let advice_pools: Arc<Vec<Mutex<Vec<Polynomial<Assigned<Scheme::Scalar>, LagrangeCoeff>>>>> =
-        Arc::new(
-            (0..circuits.len())
-                .map(|_| Mutex::new(Vec::new()))
-                .collect(),
-        );
+    let advice_pools: Arc<
+        Vec<Mutex<Vec<Polynomial<Assigned<Scheme::Scalar>, LagrangeCoeff>>>>,
+    > = Arc::new(
+        (0..circuits.len())
+            .map(|_| Mutex::new(Vec::new()))
+            .collect(),
+    );
     #[cfg(not(feature = "parallel-synthesis"))]
     let mut advice_pools: Vec<Vec<Polynomial<Assigned<Scheme::Scalar>, LagrangeCoeff>>> =
         vec![Vec::new(); circuits.len()];
@@ -494,72 +495,74 @@ where
                 let challenges_ref = &challenges;
                 let mut phase_assignments = (0..circuits.len())
                     .into_par_iter()
-                    .map(move |circuit_index| -> Result<PhaseAssignment<Scheme::Scalar>, Error> {
-                        let synth_start = Instant::now();
-                        let mut advice_storage = {
-                            let mut guard = advice_pools[circuit_index].lock().unwrap();
-                            if guard.is_empty() {
-                                guard.resize_with(meta.num_advice_columns, || {
-                                    domain.empty_lagrange_assigned()
-                                });
-                            }
-                            for poly in guard.iter_mut() {
-                                for value in poly.iter_mut() {
-                                    *value = Assigned::Zero;
+                    .map(
+                        move |circuit_index| -> Result<PhaseAssignment<Scheme::Scalar>, Error> {
+                            let synth_start = Instant::now();
+                            let mut advice_storage = {
+                                let mut guard = advice_pools[circuit_index].lock().unwrap();
+                                if guard.is_empty() {
+                                    guard.resize_with(meta.num_advice_columns, || {
+                                        domain.empty_lagrange_assigned()
+                                    });
                                 }
+                                for poly in guard.iter_mut() {
+                                    poly[0..unusable_rows_start].fill(Assigned::Zero);
+                                }
+                                let mut storage = Vec::new();
+                                std::mem::swap(&mut *guard, &mut storage);
+                                storage
+                            };
+
+                            let mut witness = WitnessCollection {
+                                k: params.k(),
+                                current_phase: current_phase_val,
+                                advice: advice_storage,
+                                instances: instances[circuit_index],
+                                challenges: challenges_ref,
+                                usable_rows: ..unusable_rows_start,
+                                _marker: std::marker::PhantomData,
+                            };
+
+                            ConcreteCircuit::FloorPlanner::synthesize(
+                                &mut witness,
+                                &circuits[circuit_index],
+                                config.clone(),
+                                meta.constants.clone(),
+                            )?;
+                            log::info!(
+                                "witness generation for phase {:?} circuit {} took {:.3?}",
+                                current_phase_val,
+                                circuit_index,
+                                synth_start.elapsed()
+                            );
+
+                            let advice_storage = witness.advice;
+                            let columns = column_indices.clone();
+                            let invert_start = Instant::now();
+                            let advice_values = batch_invert_assigned(
+                                columns
+                                    .iter()
+                                    .map(|&column_index| &advice_storage[column_index]),
+                            );
+                            log::info!(
+                                "phase {:?} circuit {}: batch inversion took {:.3?}",
+                                current_phase_val,
+                                circuit_index,
+                                invert_start.elapsed()
+                            );
+
+                            {
+                                let mut guard = advice_pools[circuit_index].lock().unwrap();
+                                *guard = advice_storage;
                             }
-                            let mut storage = Vec::new();
-                            std::mem::swap(&mut *guard, &mut storage);
-                            storage
-                        };
 
-                        let mut witness = WitnessCollection {
-                            k: params.k(),
-                            current_phase: current_phase_val,
-                            advice: advice_storage,
-                            instances: instances[circuit_index],
-                            challenges: challenges_ref,
-                            usable_rows: ..unusable_rows_start,
-                            _marker: std::marker::PhantomData,
-                        };
-
-                        ConcreteCircuit::FloorPlanner::synthesize(
-                            &mut witness,
-                            &circuits[circuit_index],
-                            config.clone(),
-                            meta.constants.clone(),
-                        )?;
-                        log::info!(
-                            "witness generation for phase {:?} circuit {} took {:.3?}",
-                            current_phase_val,
-                            circuit_index,
-                            synth_start.elapsed()
-                        );
-
-                        let advice_storage = witness.advice;
-                        let columns = column_indices.clone();
-                        let invert_start = Instant::now();
-                        let advice_values = batch_invert_assigned(
-                            columns.iter().map(|&column_index| &advice_storage[column_index]),
-                        );
-                        log::info!(
-                            "phase {:?} circuit {}: batch inversion took {:.3?}",
-                            current_phase_val,
-                            circuit_index,
-                            invert_start.elapsed()
-                        );
-
-                        {
-                            let mut guard = advice_pools[circuit_index].lock().unwrap();
-                            *guard = advice_storage;
-                        }
-
-                        Ok(PhaseAssignment {
-                            circuit_index,
-                            columns,
-                            advice_values,
-                        })
-                    })
+                            Ok(PhaseAssignment {
+                                circuit_index,
+                                columns,
+                                advice_values,
+                            })
+                        },
+                    )
                     .collect::<Result<Vec<_>, _>>()?;
 
                 phase_assignments.sort_by_key(|assignment| assignment.circuit_index);
@@ -585,13 +588,12 @@ where
                     let synth_start = Instant::now();
                     let advice_buffer = &mut advice_pools[circuit_index];
                     if advice_buffer.is_empty() {
-                        advice_buffer
-                            .resize_with(meta.num_advice_columns, || domain.empty_lagrange_assigned());
+                        advice_buffer.resize_with(meta.num_advice_columns, || {
+                            domain.empty_lagrange_assigned()
+                        });
                     }
                     for poly in advice_buffer.iter_mut() {
-                        for value in poly.iter_mut() {
-                            *value = Assigned::Zero;
-                        }
+                        poly[0..unusable_rows_start].fill(Assigned::Zero);
                     }
                     let mut advice_storage = Vec::new();
                     std::mem::swap(advice_buffer, &mut advice_storage);
@@ -623,7 +625,9 @@ where
                     let columns = column_indices.clone();
                     let invert_start = Instant::now();
                     let advice_values = batch_invert_assigned(
-                        columns.iter().map(|&column_index| &advice_storage[column_index]),
+                        columns
+                            .iter()
+                            .map(|&column_index| &advice_storage[column_index]),
                     );
                     log::info!(
                         "phase {:?} circuit {}: batch inversion took {:.3?}",

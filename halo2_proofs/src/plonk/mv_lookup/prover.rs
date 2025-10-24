@@ -9,8 +9,8 @@ use crate::SerdeFormat;
 use crate::{
     arithmetic::{eval_polynomial, CurveAffine},
     icicle::{
-        c_scalars_from_device_vec, inplace_add, inplace_invert, inplace_mul,
-        inplace_scalar_add, inplace_sub,
+        c_scalars_from_device_vec, inplace_add, inplace_invert, inplace_mul, inplace_scalar_add,
+        inplace_sub,
     },
     poly::{
         commitment::{Blind, Params},
@@ -156,11 +156,9 @@ impl GrandSumWorkspace {
     }
 
     fn zero_accumulator(&mut self, stream: &IcicleStream, len: usize) {
-        let host_slice = unsafe {
-            HostSlice::from_slice(slice::from_raw_parts(self.zero_host.as_ptr(), len))
-        };
-        self
-            .accumulator
+        let host_slice =
+            unsafe { HostSlice::from_slice(slice::from_raw_parts(self.zero_host.as_ptr(), len)) };
+        self.accumulator
             .as_mut()
             .expect("grand-sum accumulator not initialized")
             .copy_from_host_async(host_slice, stream)
@@ -173,9 +171,8 @@ impl GrandSumWorkspace {
         poly: &Polynomial<C::Scalar, LagrangeCoeff>,
     ) {
         let values: &[C::Scalar] = poly.as_ref();
-        let icicle_values: &[ScalarField] = unsafe {
-            slice::from_raw_parts(values.as_ptr() as *const ScalarField, values.len())
-        };
+        let icicle_values: &[ScalarField] =
+            unsafe { slice::from_raw_parts(values.as_ptr() as *const ScalarField, values.len()) };
         let host_slice = HostSlice::from_slice(icicle_values);
         dest.copy_from_host_async(host_slice, stream)
             .expect("copy polynomial to device");
@@ -311,11 +308,11 @@ impl<F: WithSmallOrderMulGroup<3>> Argument<F> {
         log::info!("mv_lookup::prepare: building table index mapping");
         let table_index_value_mapping: HashMap<ScalarKey<C::Scalar>, usize> =
             compressed_table_expression
-            .par_iter()
-            .take(chunk_size)
-            .enumerate()
-            .map(|(i, &x)| (ScalarKey::from_scalar(&x), i))
-            .collect();
+                .par_iter()
+                .take(chunk_size)
+                .enumerate()
+                .map(|(i, &x)| (ScalarKey::from_scalar(&x), i))
+                .collect();
         log::info!(
             "mv_lookup::prepare: table index mapping built in {:.3?}",
             start.elapsed()
@@ -495,11 +492,7 @@ impl<C: CurveAffine> Prepared<C> {
                     .take()
                     .expect("grand-sum table buffer not initialized");
 
-                GrandSumWorkspace::copy_polynomial::<C>(
-                    stream_ref,
-                    &mut m_values_buf,
-                    &m_values,
-                );
+                GrandSumWorkspace::copy_polynomial::<C>(stream_ref, &mut m_values_buf, &m_values);
 
                 GrandSumWorkspace::copy_polynomial::<C>(
                     stream_ref,
@@ -561,64 +554,66 @@ impl<C: CurveAffine> Prepared<C> {
                     phi_start.elapsed()
                 );
 
-            #[cfg(feature = "sanity-checks")]
-            // This test works only with intermediate representations in this method.
-            // It can be used for debugging purposes.
-            {
-                // While in Lagrange basis, check that product is correctly constructed
-                let u = n - (blinding_factors + 1);
+                #[cfg(feature = "sanity-checks")]
+                // This test works only with intermediate representations in this method.
+                // It can be used for debugging purposes.
+                {
+                    // While in Lagrange basis, check that product is correctly constructed
+                    let u = n - (blinding_factors + 1);
 
-                /*
-                    φ_i(X) = f_i(X) + α
-                    τ(X) = t(X) + α
-                    LHS = τ(X) * Π(φ_i(X)) * (ϕ(gX) - ϕ(X))
-                    RHS = τ(X) * Π(φ_i(X)) * (∑ 1/(φ_i(X)) - m(X) / τ(X))))
-                */
+                    /*
+                        φ_i(X) = f_i(X) + α
+                        τ(X) = t(X) + α
+                        LHS = τ(X) * Π(φ_i(X)) * (ϕ(gX) - ϕ(X))
+                        RHS = τ(X) * Π(φ_i(X)) * (∑ 1/(φ_i(X)) - m(X) / τ(X))))
+                    */
 
-                // q(X) = LHS - RHS mod zH(X)
-                for i in 0..u {
-                    // Π(φ_i(X))
-                    let fi_prod = || {
-                        let mut prod = C::Scalar::ONE;
-                        for compressed_input_expression in compressed_inputs_expressions.iter() {
-                            prod *= *beta + compressed_input_expression[i];
-                        }
+                    // q(X) = LHS - RHS mod zH(X)
+                    for i in 0..u {
+                        // Π(φ_i(X))
+                        let fi_prod = || {
+                            let mut prod = C::Scalar::ONE;
+                            for compressed_input_expression in compressed_inputs_expressions.iter()
+                            {
+                                prod *= *beta + compressed_input_expression[i];
+                            }
 
-                        prod
-                    };
+                            prod
+                        };
 
-                    let fi_log_derivative = || {
-                        let mut sum = C::Scalar::ZERO;
-                        for compressed_input_expression in compressed_inputs_expressions.iter() {
-                            sum += (*beta + compressed_input_expression[i]).invert().unwrap();
-                        }
+                        let fi_log_derivative = || {
+                            let mut sum = C::Scalar::ZERO;
+                            for compressed_input_expression in compressed_inputs_expressions.iter()
+                            {
+                                sum += (*beta + compressed_input_expression[i]).invert().unwrap();
+                            }
 
-                        sum
-                    };
+                            sum
+                        };
 
-                    // LHS = τ(X) * Π(φ_i(X)) * (ϕ(gX) - ϕ(X))
-                    let lhs = {
-                        (*beta + compressed_table_expression[i])
-                            * fi_prod()
-                            * (phi_for_checks[i + 1] - phi_for_checks[i])
-                    };
+                        // LHS = τ(X) * Π(φ_i(X)) * (ϕ(gX) - ϕ(X))
+                        let lhs = {
+                            (*beta + compressed_table_expression[i])
+                                * fi_prod()
+                                * (phi_for_checks[i + 1] - phi_for_checks[i])
+                        };
 
-                    // RHS = τ(X) * Π(φ_i(X)) * (∑ 1/(φ_i(X)) - m(X) / τ(X))))
-                    let rhs = {
-                        (*beta + compressed_table_expression[i])
-                            * fi_prod()
-                            * (fi_log_derivative()
-                                - m_values[i]
-                                    * (*beta + compressed_table_expression[i])
-                                        .invert()
-                                        .unwrap())
-                    };
+                        // RHS = τ(X) * Π(φ_i(X)) * (∑ 1/(φ_i(X)) - m(X) / τ(X))))
+                        let rhs = {
+                            (*beta + compressed_table_expression[i])
+                                * fi_prod()
+                                * (fi_log_derivative()
+                                    - m_values[i]
+                                        * (*beta + compressed_table_expression[i])
+                                            .invert()
+                                            .unwrap())
+                        };
 
-                    assert_eq!(lhs - rhs, C::Scalar::ZERO);
+                        assert_eq!(lhs - rhs, C::Scalar::ZERO);
+                    }
+
+                    assert_eq!(phi_for_checks[u], C::Scalar::ZERO);
                 }
-
-                assert_eq!(phi_for_checks[u], C::Scalar::ZERO);
-            }
 
                 let grand_sum_blind = Blind(C::Scalar::ZERO);
                 let commitment_start = instant::Instant::now();
@@ -630,12 +625,8 @@ impl<C: CurveAffine> Prepared<C> {
                     commitment_start.elapsed()
                 );
 
-                let m_poly = vk
-                    .domain
-                    .lagrange_to_coeff_stream(m_values, stream_ref);
-                let phi_poly = vk
-                    .domain
-                    .lagrange_to_coeff_stream(phi_lagrange, stream_ref);
+                let m_poly = vk.domain.lagrange_to_coeff_stream(m_values, stream_ref);
+                let phi_poly = vk.domain.lagrange_to_coeff_stream(phi_lagrange, stream_ref);
 
                 stream_ref.synchronize().unwrap();
 
