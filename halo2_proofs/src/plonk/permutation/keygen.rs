@@ -13,7 +13,7 @@ use crate::{
 };
 
 use maybe_rayon::prelude::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 
 #[cfg(feature = "thread-safe-region")]

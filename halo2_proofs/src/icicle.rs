@@ -31,6 +31,7 @@ use maybe_rayon::iter::IntoParallelRefIterator;
 use maybe_rayon::iter::ParallelIterator;
 use std::{
     any::{Any, TypeId},
+    cell::RefCell,
     ptr,
 };
 use std::{env, mem};
@@ -94,6 +95,48 @@ pub fn is_gpu_supported_field<G: Any>(_sample_element: &G) -> bool {
         id if id == TypeId::of::<Bn256Fr>() => true,
         _ => false,
     }
+}
+
+struct CachedStream {
+    inner: IcicleStream,
+}
+
+impl CachedStream {
+    fn new() -> Self {
+        let stream = IcicleStream::create().expect("failed to create Icicle stream");
+        Self { inner: stream }
+    }
+}
+
+impl Drop for CachedStream {
+    fn drop(&mut self) {
+        let _ = self.inner.synchronize();
+        let _ = self.inner.destroy();
+    }
+}
+
+thread_local! {
+    static STREAM_CACHE: RefCell<Option<CachedStream>> = RefCell::new(None);
+}
+
+/// Executes `f` with a thread-local Icicle stream, synchronizing the stream
+/// after the closure returns. The stream is cached per-thread to avoid the
+/// repeated create/destroy overhead in hot paths.
+pub fn with_stream<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut IcicleStream) -> R,
+{
+    STREAM_CACHE.with(|cell| {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(CachedStream::new());
+        }
+
+        let mut borrow = cell.borrow_mut();
+        let cached = borrow.as_mut().expect("stream cache missing entry");
+        let result = f(&mut cached.inner);
+        let _ = cached.inner.synchronize();
+        result
+    })
 }
 
 fn repr_from_u32<C: CurveAffine>(u32_arr: &[u32; 8]) -> <C as CurveAffine>::Base {

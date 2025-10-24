@@ -1,6 +1,6 @@
 use crate::icicle::{
     c_scalars_from_device_vec, create_calculation_data, create_gate_data,
-    device_vec_from_c_scalars, inplace_invert, inplace_mul,
+    device_vec_from_c_scalars, inplace_invert, inplace_mul, with_stream,
 };
 use crate::plonk::{permutation, Any, ProvingKey};
 
@@ -15,6 +15,7 @@ use crate::{
     arithmetic::{parallelize, CurveAffine},
     poly::{Coeff, ExtendedLagrangeCoeff, Polynomial, Rotation},
 };
+use crate::timing::PerfGuard;
 
 use group::ff::{Field, PrimeField, WithSmallOrderMulGroup};
 use icicle_bn254::curve::ScalarField;
@@ -137,6 +138,98 @@ pub enum Calculation {
     Horner(ValueSource, Vec<ValueSource>, ValueSource),
     /// This is a simple assignment
     Store(ValueSource),
+}
+
+#[derive(Clone, Debug)]
+struct CalculationPlan {
+    calculations: Vec<u32>,
+    targets: Vec<u32>,
+    value_types: Vec<u32>,
+    value_indices: Vec<u32>,
+    constants: Vec<ScalarField>,
+    rotations: Vec<i32>,
+    size: u32,
+    num_intermediates: u32,
+    horner_value_types: Vec<u32>,
+    horner_value_indices: Vec<u32>,
+    horner_offsets: Vec<u32>,
+    horner_sizes: Vec<u32>,
+}
+
+impl CalculationPlan {
+    fn new<C: CurveAffine>(graph: &GraphEvaluator<C>) -> Self {
+        let (
+            calculations,
+            targets,
+            value_types,
+            value_indices,
+            constants,
+            rotations,
+            size,
+            num_intermediates,
+            horner_value_types,
+            horner_value_indices,
+            horner_offsets,
+            horner_sizes,
+        ) = create_calculation_data::<C>(
+            &graph.calculations,
+            &graph.constants,
+            &graph.rotations,
+            graph.num_intermediates,
+        );
+
+        Self {
+            calculations,
+            targets,
+            value_types,
+            value_indices,
+            constants,
+            rotations,
+            size,
+            num_intermediates,
+            horner_value_types,
+            horner_value_indices,
+            horner_offsets,
+            horner_sizes,
+        }
+    }
+
+    fn instantiate(
+        &self,
+        previous_value: *const ScalarField,
+        result_on_device: bool,
+        vector_len: u32,
+        rot_scale: u32,
+        isize: u32,
+    ) -> (CalculationData<ScalarField>, HornerData) {
+        let calculation_data = CalculationData::new(
+            self.calculations.as_ptr(),
+            self.targets.as_ptr(),
+            self.value_types.as_ptr(),
+            self.value_indices.as_ptr(),
+            self.constants.as_ptr(),
+            self.constants.len() as u32,
+            self.rotations.as_ptr(),
+            self.rotations.len() as u32,
+            previous_value,
+            result_on_device,
+            self.size,
+            self.num_intermediates,
+            vector_len,
+            rot_scale,
+            isize,
+        );
+
+        let horner_data = HornerData::new(
+            self.horner_value_types.as_ptr(),
+            self.horner_value_indices.as_ptr(),
+            self.horner_offsets.as_ptr(),
+            self.horner_sizes.as_ptr(),
+            self.horner_value_types.len() as u32,
+        );
+
+        (calculation_data, horner_data)
+    }
 }
 
 impl Calculation {
@@ -394,6 +487,7 @@ impl<C: CurveAffine> Evaluator<C> {
         shuffles: &[Vec<shuffle::prover::Committed<C>>],
         permutations: &[permutation::prover::Committed<C>],
     ) -> EvaluateHOutput<C> {
+        let _total_timer = PerfGuard::new("evaluation::evaluate_h");
         log::info!("evaluation::evaluate_h: start");
         let total_start = Instant::now();
         let domain = &pk.vk.domain;
@@ -414,47 +508,59 @@ impl<C: CurveAffine> Evaluator<C> {
 
         let mut values = domain.empty_extended();
 
+        let custom_plan = CalculationPlan::new::<C>(&self.custom_gates);
+
+        #[cfg(feature = "mv-lookup")]
+        let lookup_plans: Vec<(Vec<CalculationPlan>, CalculationPlan)> = self
+            .lookups
+            .iter()
+            .map(|(inputs, table)| {
+                (
+                    inputs
+                        .iter()
+                        .map(CalculationPlan::new::<C>)
+                        .collect(),
+                    CalculationPlan::new::<C>(table),
+                )
+            })
+            .collect();
+
+        #[cfg(not(feature = "mv-lookup"))]
+        let lookup_plans: Vec<CalculationPlan> = self
+            .lookups
+            .iter()
+            .map(CalculationPlan::new::<C>)
+            .collect();
+
         // Core expression evaluations
-        for ((((advice, instance), lookups), shuffles), permutation) in advice_polys
+        for (circuit_idx, ((((advice, instance), lookups), shuffles), permutation)) in advice_polys
             .iter()
             .zip(instance_polys.iter())
             .zip(lookups.iter())
             .zip(shuffles.iter())
             .zip(permutations.iter())
+            .enumerate()
         {
+            let _circuit_timer = PerfGuard::new_silent(format!("evaluation::circuit[{circuit_idx}]"));
             let _iteration_start = Instant::now();
+            let fft_timer = PerfGuard::new_silent(format!(
+                "evaluation::circuit[{circuit_idx}]::fft"
+            ));
             let (instance, advice) = join(
                 || {
-                    let instance: Vec<Polynomial<C::Scalar, ExtendedLagrangeCoeff>> = instance
-                        .par_iter()
-                        .map(|poly| {
-                            let mut stream = IcicleStream::create().unwrap();
-                            let result = domain.coeff_to_extended(poly, &stream);
-                            stream.synchronize().unwrap();
-                            stream.destroy().unwrap();
-
-                            result
-                        })
-                        .collect();
-
                     instance
+                        .par_iter()
+                        .map(|poly| with_stream(|stream| domain.coeff_to_extended(poly, stream)))
+                        .collect::<Vec<_>>()
                 },
                 || {
-                    let advice: Vec<Polynomial<C::Scalar, ExtendedLagrangeCoeff>> = advice
-                        .par_iter()
-                        .map(|poly| {
-                            let mut stream = IcicleStream::create().unwrap();
-                            let result = domain.coeff_to_extended(poly, &stream);
-                            stream.synchronize().unwrap();
-                            stream.destroy().unwrap();
-
-                            result
-                        })
-                        .collect();
-
                     advice
+                        .par_iter()
+                        .map(|poly| with_stream(|stream| domain.coeff_to_extended(poly, stream)))
+                        .collect::<Vec<_>>()
                 },
             );
+            drop(fft_timer);
 
             let (
                 icicle_advice,
@@ -507,52 +613,13 @@ impl<C: CurveAffine> Evaluator<C> {
 
             // Custom gates
             {
-                let (
-                    icicle_calculations,
-                    targets,
-                    value_types,
-                    value_indices,
-                    icicle_constants,
-                    icicle_rotations,
-                    size,
-                    num_intermediates,
-                    horner_value_types,
-                    horner_value_indices,
-                    horner_offsets,
-                    horner_sizes,
-                ) = create_calculation_data::<C>(
-                    &self.custom_gates.calculations,
-                    &self.custom_gates.constants,
-                    &self.custom_gates.rotations,
-                    self.custom_gates.num_intermediates,
-                );
-
-                let calculation_data = CalculationData::new(
-                    icicle_calculations.as_ptr(),
-                    targets.as_ptr(),
-                    value_types.as_ptr(),
-                    value_indices.as_ptr(),
-                    icicle_constants.as_ptr(),
-                    icicle_constants.len() as u32,
-                    icicle_rotations.as_ptr(),
-                    icicle_rotations.len() as u32,
+                let (calculation_data, horner_data) = custom_plan.instantiate(
                     std::ptr::null(),
                     true,
-                    size,
-                    num_intermediates,
                     values.len() as u32,
                     rot_scale as u32,
                     isize as u32,
                 );
-
-                let horner_data = HornerData::new(
-                    horner_value_types.as_ptr(),
-                    horner_value_indices.as_ptr(),
-                    horner_offsets.as_ptr(),
-                    horner_sizes.as_ptr(),
-                    horner_value_types.len() as u32,
-                );
-
                 let mut d_result =
                     DeviceVec::device_malloc_async(values.len(), &IcicleStream::default()).unwrap();
 
@@ -676,349 +743,185 @@ impl<C: CurveAffine> Evaluator<C> {
                 let h_inputs_inv_sum = HostSlice::from_slice(&inputs_inv_sum_vec);
 
                 for (n, lookup) in lookups.iter().enumerate() {
-                    let ((m_coset, phi_coset), (inputs_inv_sums, (inputs_prods, table_values))) =
-                        join(
-                            || {
-                                let mut stream_m_poly = IcicleStream::create().unwrap();
-                                let mut stream_phi_poly = IcicleStream::create().unwrap();
+                    let (input_plans, table_plan) = &lookup_plans[n];
+                    let m_coset =
+                        with_stream(|stream| domain.coeff_to_extended_device_vec(&lookup.m_poly, stream));
+                    let phi_coset =
+                        with_stream(|stream| domain.coeff_to_extended_device_vec(&lookup.phi_poly, stream));
 
-                                let m_coset = domain
-                                    .coeff_to_extended_device_vec(&lookup.m_poly, &stream_m_poly);
-                                let phi_coset = domain.coeff_to_extended_device_vec(
-                                    &lookup.phi_poly,
-                                    &stream_phi_poly,
-                                );
+                    let inputs_inv_sums = with_stream(|stream| {
+                        let mut d_result =
+                            DeviceVec::device_malloc_async(domain.extended_len(), stream).unwrap();
 
-                                stream_m_poly.synchronize().unwrap();
-                                stream_phi_poly.synchronize().unwrap();
-                                stream_m_poly.destroy().unwrap();
-                                stream_phi_poly.destroy().unwrap();
-
-                                (m_coset, phi_coset)
-                            },
-                            || {
-                                join(
-                                    || {
-                                        let mut stream: IcicleStream =
-                                            IcicleStream::create().unwrap();
-
-                                        let mut d_result = DeviceVec::device_malloc_async(
-                                            domain.extended_len(),
-                                            &stream,
-                                        )
-                                        .unwrap();
-
-                                        let gate_data = GateData::new(
-                                            unsafe { icicle_fixed.as_ptr() },
-                                            fixed.len() as u32,
-                                            fixed[0].len() as u32,
-                                            unsafe { icicle_advice.as_ptr() },
-                                            num_advice_rows as u32,
-                                            num_advice_cols as u32,
-                                            unsafe { icicle_instance.as_ptr() },
-                                            num_instance_rows as u32,
-                                            num_instance_cols as u32,
-                                            icicle_challenges.as_ptr(),
-                                            challenges.len() as u32,
-                                            icicle_beta.as_ptr(),
-                                            icicle_gamma.as_ptr(),
-                                            icicle_theta.as_ptr(),
-                                            unsafe { icicle_y.as_ptr() },
-                                        );
-
-                                        let (inputs_lookup_evaluator, _) = &self.lookups[n];
-
-                                        let mut d_inputs_inv_sum =
-                                            DeviceVec::<ScalarField>::device_malloc_async(
-                                                values.len(),
-                                                &stream,
-                                            )
-                                            .unwrap();
-                                        d_inputs_inv_sum
-                                            .copy_from_host_async(h_inputs_inv_sum, &stream)
-                                            .unwrap();
-
-                                        // For each compressed input column, evaluate at ω^i and add beta
-                                        // This is a vector of length self.lookups[n].0.len()
-                                        inputs_lookup_evaluator.iter().for_each(
-                                            |input_lookup_evaluator| {
-                                                let (
-                                                    icicle_calculations,
-                                                    targets,
-                                                    value_types,
-                                                    value_indices,
-                                                    icicle_constants,
-                                                    icicle_rotations,
-                                                    size,
-                                                    num_intermediates,
-                                                    horner_value_types,
-                                                    horner_value_indices,
-                                                    horner_offsets,
-                                                    horner_sizes,
-                                                ) = create_calculation_data::<C>(
-                                                    &input_lookup_evaluator.calculations,
-                                                    &input_lookup_evaluator.constants,
-                                                    &input_lookup_evaluator.rotations,
-                                                    input_lookup_evaluator.num_intermediates,
-                                                );
-
-                                                let calculation_data = CalculationData::new(
-                                                    icicle_calculations.as_ptr(),
-                                                    targets.as_ptr(),
-                                                    value_types.as_ptr(),
-                                                    value_indices.as_ptr(),
-                                                    icicle_constants.as_ptr(),
-                                                    icicle_constants.len() as u32,
-                                                    icicle_rotations.as_ptr(),
-                                                    icicle_rotations.len() as u32,
-                                                    std::ptr::null(),
-                                                    true,
-                                                    size,
-                                                    num_intermediates,
-                                                    domain.extended_len() as u32,
-                                                    rot_scale as u32,
-                                                    isize as u32,
-                                                );
-
-                                                let horner_data = HornerData::new(
-                                                    horner_value_types.as_ptr(),
-                                                    horner_value_indices.as_ptr(),
-                                                    horner_offsets.as_ptr(),
-                                                    horner_sizes.as_ptr(),
-                                                    horner_value_types.len() as u32,
-                                                );
-
-                                                let mut cfg = GateOpsConfig::default();
-                                                cfg.is_async = true;
-                                                cfg.stream_handle = (&stream).into();
-                                                cfg.is_fixed_on_device = true;
-                                                cfg.is_advice_on_device = true;
-                                                cfg.is_instance_on_device = true;
-                                                cfg.is_previous_value_on_device = true;
-                                                cfg.is_result_on_device = true;
-
-                                                gate_evaluation(
-                                                    &gate_data,
-                                                    &calculation_data,
-                                                    &horner_data,
-                                                    &mut d_result[..],
-                                                    &cfg,
-                                                )
-                                                .unwrap();
-
-                                                let cfg = VecOpsConfig::default();
-                                                inplace_invert(&mut d_result, &stream);
-
-                                                accumulate_scalars(
-                                                    &mut d_inputs_inv_sum,
-                                                    &d_result,
-                                                    &cfg,
-                                                )
-                                                .unwrap();
-                                            },
-                                        );
-
-                                        stream.synchronize().unwrap();
-                                        stream.destroy().unwrap();
-
-                                        d_inputs_inv_sum
-                                    },
-                                    || {
-                                        let mut stream = IcicleStream::create().unwrap();
-                                        let mut d_result = DeviceVec::device_malloc_async(
-                                            domain.extended_len(),
-                                            &stream,
-                                        )
-                                        .unwrap();
-
-                                        let gate_data = GateData::new(
-                                            unsafe { icicle_fixed.as_ptr() },
-                                            fixed.len() as u32,
-                                            fixed[0].len() as u32,
-                                            unsafe { icicle_advice.as_ptr() },
-                                            num_advice_rows as u32,
-                                            num_advice_cols as u32,
-                                            unsafe { icicle_instance.as_ptr() },
-                                            num_instance_rows as u32,
-                                            num_instance_cols as u32,
-                                            icicle_challenges.as_ptr(),
-                                            challenges.len() as u32,
-                                            icicle_beta.as_ptr(),
-                                            icicle_gamma.as_ptr(),
-                                            icicle_theta.as_ptr(),
-                                            unsafe { icicle_y.as_ptr() },
-                                        );
-
-                                        let (inputs_lookup_evaluator, table_lookup_evaluator) =
-                                            &self.lookups[n];
-
-                                        let inputs_prods_vec =
-                                            vec![ScalarField::one(); values.len()];
-                                        let h_inputs_prods =
-                                            HostSlice::from_slice(&inputs_prods_vec);
-                                        let mut d_inputs_prods =
-                                            DeviceVec::<ScalarField>::device_malloc_async(
-                                                values.len(),
-                                                &stream,
-                                            )
-                                            .unwrap();
-                                        d_inputs_prods
-                                            .copy_from_host_async(h_inputs_prods, &stream)
-                                            .unwrap();
-
-                                        inputs_lookup_evaluator.iter().for_each(
-                                            |input_lookup_evaluator| {
-                                                let (
-                                                    icicle_calculations,
-                                                    targets,
-                                                    value_types,
-                                                    value_indices,
-                                                    icicle_constants,
-                                                    icicle_rotations,
-                                                    size,
-                                                    num_intermediates,
-                                                    horner_value_types,
-                                                    horner_value_indices,
-                                                    horner_offsets,
-                                                    horner_sizes,
-                                                ) = create_calculation_data::<C>(
-                                                    &input_lookup_evaluator.calculations,
-                                                    &input_lookup_evaluator.constants,
-                                                    &input_lookup_evaluator.rotations,
-                                                    input_lookup_evaluator.num_intermediates,
-                                                );
-
-                                                let calculation_data = CalculationData::new(
-                                                    icicle_calculations.as_ptr(),
-                                                    targets.as_ptr(),
-                                                    value_types.as_ptr(),
-                                                    value_indices.as_ptr(),
-                                                    icicle_constants.as_ptr(),
-                                                    icicle_constants.len() as u32,
-                                                    icicle_rotations.as_ptr(),
-                                                    icicle_rotations.len() as u32,
-                                                    unsafe { icicle_previous_value.as_ptr() },
-                                                    false,
-                                                    size,
-                                                    num_intermediates,
-                                                    values.len() as u32,
-                                                    rot_scale as u32,
-                                                    isize as u32,
-                                                );
-
-                                                let horner_data = HornerData::new(
-                                                    horner_value_types.as_ptr(),
-                                                    horner_value_indices.as_ptr(),
-                                                    horner_offsets.as_ptr(),
-                                                    horner_sizes.as_ptr(),
-                                                    horner_value_types.len() as u32,
-                                                );
-
-                                                let mut cfg = GateOpsConfig::default();
-
-                                                cfg.is_fixed_on_device = true;
-                                                cfg.is_advice_on_device = true;
-                                                cfg.is_instance_on_device = true;
-                                                cfg.is_previous_value_on_device = true;
-                                                cfg.is_result_on_device = true;
-
-                                                gate_evaluation(
-                                                    &gate_data,
-                                                    &calculation_data,
-                                                    &horner_data,
-                                                    &mut d_result[..],
-                                                    &cfg,
-                                                )
-                                                .unwrap();
-
-                                                inplace_mul(
-                                                    &mut d_inputs_prods,
-                                                    &d_result,
-                                                    &stream,
-                                                );
-                                            },
-                                        );
-
-                                        let table_values: DeviceVec<ScalarField> = {
-                                            let (
-                                                icicle_calculations,
-                                                targets,
-                                                value_types,
-                                                value_indices,
-                                                icicle_constants,
-                                                icicle_rotations,
-                                                size,
-                                                num_intermediates,
-                                                horner_value_types,
-                                                horner_value_indices,
-                                                horner_offsets,
-                                                horner_sizes,
-                                            ) = create_calculation_data::<C>(
-                                                &table_lookup_evaluator.calculations,
-                                                &table_lookup_evaluator.constants,
-                                                &table_lookup_evaluator.rotations,
-                                                table_lookup_evaluator.num_intermediates,
-                                            );
-
-                                            let calculation_data = CalculationData::new(
-                                                icicle_calculations.as_ptr(),
-                                                targets.as_ptr(),
-                                                value_types.as_ptr(),
-                                                value_indices.as_ptr(),
-                                                icicle_constants.as_ptr(),
-                                                icicle_constants.len() as u32,
-                                                icicle_rotations.as_ptr(),
-                                                icicle_rotations.len() as u32,
-                                                unsafe { icicle_previous_value.as_ptr() },
-                                                false,
-                                                size,
-                                                num_intermediates,
-                                                domain.extended_len() as u32,
-                                                rot_scale as u32,
-                                                isize as u32,
-                                            );
-
-                                            let horner_data = HornerData::new(
-                                                horner_value_types.as_ptr(),
-                                                horner_value_indices.as_ptr(),
-                                                horner_offsets.as_ptr(),
-                                                horner_sizes.as_ptr(),
-                                                horner_value_types.len() as u32,
-                                            );
-
-                                            let mut cfg = GateOpsConfig::default();
-                                            cfg.is_fixed_on_device = true;
-                                            cfg.is_advice_on_device = true;
-                                            cfg.is_instance_on_device = true;
-                                            cfg.is_previous_value_on_device = true;
-
-                                            let mut d_table_values =
-                                                DeviceVec::device_malloc_async(
-                                                    values.len(),
-                                                    &stream,
-                                                )
-                                                .unwrap();
-
-                                            gate_evaluation(
-                                                &gate_data,
-                                                &calculation_data,
-                                                &horner_data,
-                                                &mut d_table_values[..],
-                                                &cfg,
-                                            )
-                                            .unwrap();
-
-                                            d_table_values
-                                        };
-
-                                        stream.synchronize().unwrap();
-                                        stream.destroy().unwrap();
-
-                                        (d_inputs_prods, table_values)
-                                    },
-                                )
-                            },
+                        let gate_data = GateData::new(
+                            unsafe { icicle_fixed.as_ptr() },
+                            fixed.len() as u32,
+                            fixed[0].len() as u32,
+                            unsafe { icicle_advice.as_ptr() },
+                            num_advice_rows as u32,
+                            num_advice_cols as u32,
+                            unsafe { icicle_instance.as_ptr() },
+                            num_instance_rows as u32,
+                            num_instance_cols as u32,
+                            icicle_challenges.as_ptr(),
+                            challenges.len() as u32,
+                            icicle_beta.as_ptr(),
+                            icicle_gamma.as_ptr(),
+                            icicle_theta.as_ptr(),
+                            unsafe { icicle_y.as_ptr() },
                         );
+
+                        let (inputs_lookup_evaluator, _) = &self.lookups[n];
+
+                        let mut d_inputs_inv_sum = DeviceVec::<ScalarField>::device_malloc_async(
+                            values.len(),
+                            stream,
+                        )
+                        .unwrap();
+                        d_inputs_inv_sum
+                            .copy_from_host_async(h_inputs_inv_sum, stream)
+                            .unwrap();
+
+                        for (_input_lookup_evaluator, plan) in inputs_lookup_evaluator
+                            .iter()
+                            .zip(input_plans.iter())
+                        {
+                            let (calculation_data, horner_data) = plan.instantiate(
+                                std::ptr::null(),
+                                true,
+                                domain.extended_len() as u32,
+                                rot_scale as u32,
+                                isize as u32,
+                            );
+
+                            let mut cfg = GateOpsConfig::default();
+                            cfg.is_async = true;
+                            cfg.stream_handle = (&*stream).into();
+                            cfg.is_fixed_on_device = true;
+                            cfg.is_advice_on_device = true;
+                            cfg.is_instance_on_device = true;
+                            cfg.is_previous_value_on_device = true;
+                            cfg.is_result_on_device = true;
+
+                            gate_evaluation(
+                                &gate_data,
+                                &calculation_data,
+                                &horner_data,
+                                &mut d_result[..],
+                                &cfg,
+                            )
+                            .unwrap();
+
+                            let cfg = VecOpsConfig::default();
+                            inplace_invert(&mut d_result, &*stream);
+
+                            accumulate_scalars(&mut d_inputs_inv_sum, &d_result, &cfg).unwrap();
+                        }
+
+                        d_inputs_inv_sum
+                    });
+
+                    let (inputs_prods, table_values) = with_stream(|stream| {
+                        let mut d_result =
+                            DeviceVec::device_malloc_async(domain.extended_len(), stream).unwrap();
+
+                        let gate_data = GateData::new(
+                            unsafe { icicle_fixed.as_ptr() },
+                            fixed.len() as u32,
+                            fixed[0].len() as u32,
+                            unsafe { icicle_advice.as_ptr() },
+                            num_advice_rows as u32,
+                            num_advice_cols as u32,
+                            unsafe { icicle_instance.as_ptr() },
+                            num_instance_rows as u32,
+                            num_instance_cols as u32,
+                            icicle_challenges.as_ptr(),
+                            challenges.len() as u32,
+                            icicle_beta.as_ptr(),
+                            icicle_gamma.as_ptr(),
+                            icicle_theta.as_ptr(),
+                            unsafe { icicle_y.as_ptr() },
+                        );
+
+                        let (inputs_lookup_evaluator, _) = &self.lookups[n];
+
+                        let inputs_prods_vec = vec![ScalarField::one(); values.len()];
+                        let h_inputs_prods = HostSlice::from_slice(&inputs_prods_vec);
+                        let mut d_inputs_prods = DeviceVec::<ScalarField>::device_malloc_async(
+                            values.len(),
+                            stream,
+                        )
+                        .unwrap();
+                        d_inputs_prods
+                            .copy_from_host_async(h_inputs_prods, stream)
+                            .unwrap();
+
+                        for (_input_lookup_evaluator, plan) in inputs_lookup_evaluator
+                            .iter()
+                            .zip(input_plans.iter())
+                        {
+                            let (calculation_data, horner_data) = plan.instantiate(
+                                unsafe { icicle_previous_value.as_ptr() },
+                                false,
+                                values.len() as u32,
+                                rot_scale as u32,
+                                isize as u32,
+                            );
+
+                            let mut cfg = GateOpsConfig::default();
+                            cfg.is_fixed_on_device = true;
+                            cfg.is_advice_on_device = true;
+                            cfg.is_instance_on_device = true;
+                            cfg.is_previous_value_on_device = true;
+                            cfg.is_result_on_device = true;
+
+                            gate_evaluation(
+                                &gate_data,
+                                &calculation_data,
+                                &horner_data,
+                                &mut d_result[..],
+                                &cfg,
+                            )
+                            .unwrap();
+
+                            inplace_mul(&mut d_inputs_prods, &d_result, &*stream);
+                        }
+
+                        let table_values = {
+                            let (calculation_data, horner_data) = table_plan.instantiate(
+                                unsafe { icicle_previous_value.as_ptr() },
+                                false,
+                                domain.extended_len() as u32,
+                                rot_scale as u32,
+                                isize as u32,
+                            );
+
+                            let mut cfg = GateOpsConfig::default();
+                            cfg.is_fixed_on_device = true;
+                            cfg.is_advice_on_device = true;
+                            cfg.is_instance_on_device = true;
+                            cfg.is_previous_value_on_device = true;
+
+                            let mut d_table_values = DeviceVec::device_malloc_async(
+                                values.len(),
+                                stream,
+                            )
+                            .unwrap();
+
+                            gate_evaluation(
+                                &gate_data,
+                                &calculation_data,
+                                &horner_data,
+                                &mut d_table_values[..],
+                                &cfg,
+                            )
+                            .unwrap();
+
+                            d_table_values
+                        };
+
+                        (d_inputs_prods, table_values)
+                    });
 
                     let lookup_data = LookupData::new(
                         unsafe { table_values.as_ptr() },
@@ -1088,34 +991,23 @@ impl<C: CurveAffine> Evaluator<C> {
                         &cosets.remove(0);
 
                     #[cfg(not(feature = "precompute-coset"))]
-                    let (product_coset, permuted_input_coset, permuted_table_coset) = {
-                        let mut stream_coset = IcicleStream::create().unwrap();
-                        let mut stream_input_coset = IcicleStream::create().unwrap();
-                        let mut stream_table_coset = IcicleStream::create().unwrap();
-
-                        let product_coset = pk
-                            .vk
-                            .domain
-                            .coeff_to_extended(&lookup.product_poly, &stream_coset);
-                        let permuted_input_coset = pk
-                            .vk
-                            .domain
-                            .coeff_to_extended(&lookup.permuted_input_poly, &stream_input_coset);
-                        let permuted_table_coset = pk
-                            .vk
-                            .domain
-                            .coeff_to_extended(&lookup.permuted_table_poly, &stream_table_coset);
-
-                        stream_coset.synchronize().unwrap();
-                        stream_input_coset.synchronize().unwrap();
-                        stream_table_coset.synchronize().unwrap();
-
-                        stream_coset.destroy().unwrap();
-                        stream_input_coset.destroy().unwrap();
-                        stream_table_coset.destroy().unwrap();
-
-                        (product_coset, permuted_input_coset, permuted_table_coset)
-                    };
+                    let (product_coset, permuted_input_coset, permuted_table_coset) = (
+                        with_stream(|stream| {
+                            pk.vk
+                                .domain
+                                .coeff_to_extended(&lookup.product_poly, stream)
+                        }),
+                        with_stream(|stream| {
+                            pk.vk
+                                .domain
+                                .coeff_to_extended(&lookup.permuted_input_poly, stream)
+                        }),
+                        with_stream(|stream| {
+                            pk.vk
+                                .domain
+                                .coeff_to_extended(&lookup.permuted_table_poly, stream)
+                        }),
+                    );
 
                     // Lookup constraints
                     parallelize(&mut values, |values, start| {
