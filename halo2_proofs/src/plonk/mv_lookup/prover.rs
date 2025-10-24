@@ -39,7 +39,13 @@ use std::{
     iter,
     ops::{Mul, MulAssign},
     slice,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+
+const OOR_LOG_LIMIT: usize = 16;
+static OOR_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static OOR_TOTAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+static OOR_DETECTED: AtomicBool = AtomicBool::new(false);
 
 struct ScalarKey<F>
 where
@@ -69,22 +75,29 @@ where
             repr: value.to_repr(),
         }
     }
+
+    fn as_bytes(&self) -> &[u8]
+    where
+        F::Repr: AsRef<[u8]>,
+    {
+        self.repr.as_ref()
+    }
 }
 
 impl<F> PartialEq for ScalarKey<F>
 where
     F: PrimeField,
-    F::Repr: PartialEq,
+    F::Repr: AsRef<[u8]>,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.repr == other.repr
+        self.repr.as_ref() == other.repr.as_ref()
     }
 }
 
 impl<F> Eq for ScalarKey<F>
 where
     F: PrimeField,
-    F::Repr: Eq,
+    F::Repr: AsRef<[u8]>,
 {
 }
 
@@ -239,9 +252,12 @@ impl<F: WithSmallOrderMulGroup<3>> Argument<F> {
         C: CurveAffine<ScalarExt = F>,
         F: PrimeField,
         C::Curve: Mul<F, Output = C::Curve> + MulAssign<F>,
-        F::Repr: Clone + Eq + AsRef<[u8]> + Send + Sync,
+        F::Repr: Clone + AsRef<[u8]> + Send + Sync,
     {
         let n = params.n() as usize;
+        OOR_LOG_COUNT.store(0, Ordering::Relaxed);
+        OOR_TOTAL_COUNT.store(0, Ordering::Relaxed);
+        OOR_DETECTED.store(false, Ordering::Relaxed);
         // Closure to get values of expressions and compress them
         let compress_expressions = |expressions: &[Expression<C::Scalar>]| {
             let compressed_expression = expressions
@@ -315,11 +331,20 @@ impl<F: WithSmallOrderMulGroup<3>> Argument<F> {
                     .iter()
                     .take(chunk_size)
                     .for_each(|fi| {
-                        let repr = fi.to_repr();
-                        if let Some(&index) = table_index_value_mapping.get(repr.as_ref()) {
+                        let key = ScalarKey::from_scalar(fi);
+                        if let Some(&index) = table_index_value_mapping.get(&key) {
                             local_counts[index] += 1;
                         } else {
-                            log::error!("value is OOR of lookup");
+                            let logged = OOR_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                            OOR_TOTAL_COUNT.fetch_add(1, Ordering::Relaxed);
+                            OOR_DETECTED.store(true, Ordering::Relaxed);
+                            if logged < OOR_LOG_LIMIT {
+                                log::error!(
+                                    "value is OOR of lookup (sample {}): {:?}",
+                                    logged + 1,
+                                    key.as_bytes()
+                                );
+                            }
                         }
                     });
                 local_counts
@@ -335,6 +360,15 @@ impl<F: WithSmallOrderMulGroup<3>> Argument<F> {
             );
 
         multiplicities.resize(params.n() as usize, 0);
+
+        if OOR_DETECTED.load(Ordering::Relaxed) {
+            let total_missed = OOR_TOTAL_COUNT.load(Ordering::Relaxed);
+            log::error!(
+                "{} lookup value(s) were missing from the table during mv-lookup preparation",
+                total_missed
+            );
+            return Err(Error::ConstraintSystemFailure);
+        }
 
         let m_values: Vec<F> = multiplicities.into_par_iter().map(F::from).collect();
         log::info!(

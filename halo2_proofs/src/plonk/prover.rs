@@ -107,7 +107,7 @@ where
     Scheme::Scalar: WithSmallOrderMulGroup<3> + FromUniformBytes<64>,
     Scheme::ParamsProver: Send + Sync,
     ConcreteCircuit::Config: Send + Sync,
-    <Scheme::Scalar as PrimeField>::Repr: Eq + Clone + AsRef<[u8]> + Send + Sync,
+    <Scheme::Scalar as PrimeField>::Repr: Clone + AsRef<[u8]> + Send + Sync,
 {
     #[cfg(feature = "counter")]
     {
@@ -490,6 +490,8 @@ where
                 let phase_collection_start = Instant::now();
                 let column_indices = column_indices.clone();
                 let advice_pools = Arc::clone(&advice_pools);
+                let config = config.clone();
+                let challenges_ref = &challenges;
                 let mut phase_assignments = (0..circuits.len())
                     .into_par_iter()
                     .map(move |circuit_index| -> Result<PhaseAssignment<Scheme::Scalar>, Error> {
@@ -516,7 +518,7 @@ where
                             current_phase: current_phase_val,
                             advice: advice_storage,
                             instances: instances[circuit_index],
-                            challenges: &challenges,
+                            challenges: challenges_ref,
                             usable_rows: ..unusable_rows_start,
                             _marker: std::marker::PhantomData,
                         };
